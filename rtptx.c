@@ -21,7 +21,7 @@
 #include "addr_list.h"
 
 static void exit_with_usage() {
-    fprintf(stderr, "Usage: rtptx <locips> <dstips> <dstport0> <#TSs> <TS bitrate (Mbps)>\n"); 
+    fprintf(stderr, "Usage: rtptx [--sndbuf] <locips> <dstips> <dstport0> <#TSs> <TS bitrate (Mbps)>\n"); 
     exit(0);
 }
 
@@ -31,6 +31,7 @@ struct global_data {
     uint32_t bpi; // bits per interval
     ns_t interval;
     uint16_t dstport0;
+    bool sndbuf;
 } *global_data_ptr = NULL;
 
 struct thread_data {
@@ -77,12 +78,13 @@ static void *run(void *arg) {
         }
     }
     
-    //int bufsize = 5242880; // copied from /proc/sys/net/core/wmem_max
-    //if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(int)) < 0) {
-    //        fprintf(stderr, "setsockopt(SO_SNDBUF, %d) failed for port %u: %m\n", 
-    //                bufsize, dstport);
-    //}
-
+    if (global_data_ptr->sndbuf) {
+        int bufsize = 5242880; // copied from /proc/sys/net/core/wmem_max
+        if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(int)) < 0) {
+                fprintf(stderr, "setsockopt(SO_SNDBUF, %d) failed for port %u: %m\n", 
+                        bufsize, dstport);
+        }
+    }
     
     uint8_t buf[12 + 7 * 188];
     struct iovec iov;
@@ -157,8 +159,18 @@ leave:
 }
 
 int main(int argc, char **argv) {
-    struct global_data global_data = { .dstport0 = 0 };
+    struct global_data global_data = { .dstport0 = 0, .sndbuf = false };
     global_data_ptr = &global_data;
+    
+    while (argc > 6) {
+        if (!strcmp(argv[1], "--sndbuf")) {
+            global_data.sndbuf = true;
+        } else {
+            exit_with_usage();  
+        }
+        argv++;
+        argc--;
+    }
 
     if (argc != 6) 
         exit_with_usage();
