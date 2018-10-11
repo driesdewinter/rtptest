@@ -36,8 +36,8 @@ RTP receive tool:
 rtprx <locip> <dstip> <srcip> <dstport0> <#TSs>
 ```
 - <locip> is the local IPv4-address to bind to. Use 0.0.0.0 if you don't care.
-- <dstip> is the destination IPv4-address for multicast streams. When set to any valid multicast address, this multicast group is joined using IGMP SSM. Use 0.0.0.0 for unicast streams.
-- <srcip> is the source IPv4-address for multicast streams. When multicast is used, this address is used as source address for IGMP SSM. Use 0.0.0.0 for unicast streams.
+- <dstip> is the destination IPv4-address for multicast streams. When set to any valid multicast address, this multicast group is joined, using IGMP (optionally source specific). Use 0.0.0.0 for unicast streams.
+- <srcip> is the source IPv4-address for multicast streams. When multicast is used, this address is used as source address for source specific multicast. Use 0.0.0.0 for unicast streams and non-source specific multicast.
 - <dstport0> UDP port number of first RTP stream. Second stream is expected on dstport0 + 1 and so on.
 - <#TSs> Number of streams to receive. Every stream runs in a separate thread.
 
