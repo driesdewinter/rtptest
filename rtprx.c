@@ -78,21 +78,44 @@ static void *run(void *arg) {
     if ((dstip[0] & 0xf0) == 0xe0) {
         struct sockaddr_in* locaddr = addr_list_get(&global_data_ptr->locaddr, thread_data_ptr->index);
         struct sockaddr_in* srcaddr = addr_list_get(&global_data_ptr->srcaddr, thread_data_ptr->index);
-        struct ip_mreq_source mreq;
-        mreq.imr_multiaddr = dstaddr.sin_addr;
-        mreq.imr_interface = locaddr->sin_addr;
-        mreq.imr_sourceaddr = srcaddr->sin_addr;
-        if (setsockopt(s, SOL_IP, IP_ADD_SOURCE_MEMBERSHIP, &mreq, sizeof(mreq))) {
-            char dstaddrbuf[20];
-            char locaddrbuf[20];
-            char srcaddrbuf[20];
         
-            fprintf(stderr, "setsockopt(IP_ADD_SOURCE_MEMBERSHIP, %s@%s:IN(%s)) failed for port %u: %m\n", 
-                    inet_ntop(dstaddr.sin_family, &dstaddr.sin_addr, dstaddrbuf, sizeof(dstaddrbuf)), 
-                    inet_ntop(locaddr->sin_family, &locaddr->sin_addr, locaddrbuf, sizeof(locaddrbuf)), 
-                    inet_ntop(srcaddr->sin_family, &srcaddr->sin_addr, srcaddrbuf, sizeof(srcaddrbuf)),
-                    dstport);
-            goto leave;
+        if (srcaddr->sin_addr.s_addr == INADDR_ANY)
+        { // -> EXCLUDE(), a.k.a. non-source specific multicast
+          struct ip_mreq mreq;
+          mreq.imr_multiaddr = dstaddr.sin_addr;
+          mreq.imr_interface = locaddr->sin_addr;
+
+          if (setsockopt(s, SOL_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) {
+              char dstaddrbuf[20];
+              char locaddrbuf[20];
+
+              fprintf(stderr, "setsockopt(IP_ADD_MEMBERSHIP, %s@%s:EX()) failed for port %u: %m\n",
+                      inet_ntop(dstaddr.sin_family, &dstaddr.sin_addr, dstaddrbuf, sizeof(dstaddrbuf)),
+                      inet_ntop(locaddr->sin_family, &locaddr->sin_addr, locaddrbuf, sizeof(locaddrbuf)),
+                      dstport);
+              goto leave;
+          }
+        }
+        else
+        { // -> INCLUDE(srcaddr), a.k.a. source specific multicast
+          struct ip_mreq_source mreq;
+          mreq.imr_multiaddr = dstaddr.sin_addr;
+          mreq.imr_interface = locaddr->sin_addr;
+          mreq.imr_sourceaddr = srcaddr->sin_addr;
+
+          if (setsockopt(s, SOL_IP, IP_ADD_SOURCE_MEMBERSHIP, &mreq, sizeof(mreq))) {
+              char dstaddrbuf[20];
+              char locaddrbuf[20];
+              char srcaddrbuf[20];
+
+              fprintf(stderr, "setsockopt(IP_ADD_SOURCE_MEMBERSHIP, %s@%s:IN(%s)) failed for port %u: %m\n",
+                      inet_ntop(dstaddr.sin_family, &dstaddr.sin_addr, dstaddrbuf, sizeof(dstaddrbuf)),
+                      inet_ntop(locaddr->sin_family, &locaddr->sin_addr, locaddrbuf, sizeof(locaddrbuf)),
+                      inet_ntop(srcaddr->sin_family, &srcaddr->sin_addr, srcaddrbuf, sizeof(srcaddrbuf)),
+                      dstport);
+              goto leave;
+
+          }
         }
     }
 
