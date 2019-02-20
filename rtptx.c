@@ -153,7 +153,7 @@ static void *run(void *arg) {
                 goto leave;
             }
         }
-        else if (t1 - t > thread_data_ptr->max_drift)
+        else if (t < t1 && t1 - t > thread_data_ptr->max_drift)
         {
           thread_data_ptr->max_drift = t1 - t;
         }
