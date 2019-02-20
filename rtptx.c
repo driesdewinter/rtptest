@@ -43,6 +43,7 @@ struct thread_data {
     uint32_t prev_spent;
     uint32_t prev_intervalcounter;
     bool stopped;
+    ns_t max_drift;
 };
 
 static void *run(void *arg) {
@@ -142,6 +143,7 @@ static void *run(void *arg) {
         thread_data_ptr->sent += sent;
         
         t += global_data_ptr->interval;
+
         if (t >= t1 + 1000) {
             struct timeval tv;
             ns_totimeval(t - t1, &tv);
@@ -150,6 +152,10 @@ static void *run(void *arg) {
                 fprintf(stderr, "select() failed for port %u: %m\n", dstport);
                 goto leave;
             }
+        }
+        else if (t1 - t > thread_data_ptr->max_drift)
+        {
+          thread_data_ptr->max_drift = t1 - t;
         }
     }
 leave:
@@ -220,12 +226,12 @@ int main(int argc, char **argv) {
     }
     ns_t t0 = ns_now();
     
-    printf("      port |       sent | rate(Mbps) |    load(%%)\n");
-    printf("==================================================\n");
+    printf("      port |       sent | rate(Mbps) |    load(%%) | max_drift(ms)\n");
+    printf("==================================================================\n");
     for (i = 0; i < N; i++)
-        printf("%10u | %10u | %6" PRIu32 ".%03" PRIu32 " | %10u\n", global_data.dstport0 + i, 0, 0, 0, 0);
-    printf("==================================================\n");
-    printf("     total | %10u | %6" PRIu32 ".%03" PRIu32 " | %10u\n", 0, 0, 0, 0);
+        printf("%10u | %10u | %6" PRIu32 ".%03" PRIu32 " | %10u | %6u.%06u\n", global_data.dstport0 + i, 0, 0, 0, 0, 0, 0);
+    printf("==================================================================\n");
+    printf("     total | %10u | %6" PRIu32 ".%03" PRIu32 " | %10u | %6u.%06u\n", 0, 0, 0, 0, 0, 0);
     
     for(;;) {
         int stopped = 0;
@@ -248,6 +254,7 @@ int main(int argc, char **argv) {
         uint32_t tot_sent = 0;
         uint32_t tot_rate = 0;
         uint32_t tot_load = 0;
+        ns_t tot_max_drift = 0;
         for (i = 0; i < N; i++) {
             uint32_t sent = thread_data[i].sent;
             tot_sent += sent;
@@ -261,15 +268,18 @@ int main(int argc, char **argv) {
                 load = (spent - thread_data[i].prev_spent) * 100ULL / 
                         (intervalcounter - thread_data[i].prev_intervalcounter) / global_data.interval;
             }
+            ns_t max_drift = thread_data[i].max_drift;
+            if (max_drift > tot_max_drift)
+                tot_max_drift = max_drift;
             thread_data[i].prev_spent = spent;
             thread_data[i].prev_intervalcounter = intervalcounter;
             tot_load += load;
-            printf("%10u | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n", 
-                    global_data.dstport0 + i, sent, rate/1000, rate%1000, load);
+            printf("%10u | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 " | %6" PRIu64 ".%06" PRIu64 "\n",
+                    global_data.dstport0 + i, sent, rate/1000, rate%1000, load, max_drift/1000000UL, max_drift%1000000UL);
         }
         printf("==================================================\n");
-        printf("     total | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n", 
-            tot_sent, tot_rate/1000, tot_rate%1000, tot_load);
+        printf("     total | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 " | %6" PRIu64 ".%06" PRIu64 "\n",
+            tot_sent, tot_rate/1000, tot_rate%1000, tot_load, tot_max_drift/1000000UL, tot_max_drift%1000000UL);
            
         t0 = t1;
     }
