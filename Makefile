@@ -4,13 +4,13 @@ HDRS = rtp_window.h addr_list.h ns.h
 default: rtptx rtprx
 
 rtptx: rtptx.c $(HDRS)
-	gcc -O3 -Wall -Wextra -pthread -o rtptx rtptx.c -lrt
+	gcc -std=c11 -O3 -Wall -Wextra -pthread -o rtptx rtptx.c -lrt
 
 rtprx: rtprx.c $(HDRS)
-	gcc -O3 -Wall -Wextra -pthread -o rtprx rtprx.c -lrt
+	gcc -std=c11 -O3 -Wall -Wextra -pthread -o rtprx rtprx.c -lrt
 
 rtp_window_test: rtp_window_test.c $(HDRS)
-	gcc -O0 -Wall -Wextra -pthread -o rtp_window_test rtp_window_test.c -lrt
+	gcc -std=c11 -O0 -Wall -Wextra -pthread -o rtp_window_test rtp_window_test.c -lrt
 
 test: rtp_window_test
 	./rtp_window_test

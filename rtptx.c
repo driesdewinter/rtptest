@@ -1,4 +1,5 @@
 #define __STDC_FORMAT_MACROS
+#define _GNU_SOURCE
 #include <inttypes.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -16,12 +17,13 @@
 #include <pthread.h>
 #include <net/if.h>
 #include <sys/prctl.h>
+#include <signal.h>
 
 #include "ns.h"
 #include "addr_list.h"
 
 static void exit_with_usage() {
-    fprintf(stderr, "Usage: rtptx [--sndbuf] <locips> <dstips> <dstport0> <#TSs> <TS bitrate (Mbps)>\n"); 
+    fprintf(stderr, "Usage: rtptx [-d] [--sndbuf] [-i <ms>] <locips> <dstips> <dstport0> <#TSs> <TS bitrate (Mbps)>\n");
     exit(0);
 }
 
@@ -32,6 +34,11 @@ struct global_data {
     ns_t interval;
     uint16_t dstport0;
     bool sndbuf;
+    bool daemonize;
+    int signum;
+    int killed;
+    int N;
+    ns_t t0;
 } *global_data_ptr = NULL;
 
 struct thread_data {
@@ -44,7 +51,12 @@ struct thread_data {
     uint32_t prev_intervalcounter;
     bool stopped;
     ns_t max_drift;
-};
+} *thread_data_ptr = NULL;
+
+static void sighandle(int signum)
+{
+  global_data_ptr->signum = signum;
+}
 
 static void *run(void *arg) {
     struct thread_data *thread_data_ptr = arg;
@@ -116,7 +128,7 @@ static void *run(void *arg) {
     ns_t t = ns_now();
     uint32_t bytebucket = 0;
     
-    for (;;) {
+    for (;!global_data_ptr->killed;) {
         
         ns_t t0 = ns_now();
         
@@ -147,11 +159,7 @@ static void *run(void *arg) {
         if (t >= t1 + 1000) {
             struct timeval tv;
             ns_totimeval(t - t1, &tv);
-            if (select(0, NULL, NULL, NULL, &tv) < 0)
-            {
-                fprintf(stderr, "select() failed for port %u: %m\n", dstport);
-                goto leave;
-            }
+            select(0, NULL, NULL, NULL, &tv);
         }
         else if (t < t1 && t1 - t > thread_data_ptr->max_drift)
         {
@@ -164,13 +172,70 @@ leave:
     return NULL;
 }
 
+static void report()
+{
+  static bool reported = false;
+
+  if (!reported || global_data_ptr->daemonize) {
+      reported = true;
+  } else {
+      printf("\r");
+      for (int i = 0; i < global_data_ptr->N + 4; i++)
+          printf("%s", "\033[A");
+  }
+
+  printf("      port |       sent | rate(Mbps) |    load(%%) | max_drift(ms)\n");
+  printf("=================================================================\n");
+
+  ns_t t1 = ns_now();
+  ns_t elapsed = t1 - global_data_ptr->t0;
+
+  uint32_t tot_sent = 0;
+  uint32_t tot_rate = 0;
+  uint32_t tot_load = 0;
+  ns_t tot_max_drift = 0;
+  for (int i = 0; i < global_data_ptr->N; i++) {
+      uint32_t sent = thread_data_ptr[i].sent;
+      tot_sent += sent;
+      uint32_t rate = (uint64_t)(sent - thread_data_ptr[i].prev_sent) * 7 * 188 * 8 * 1000000 / (elapsed?:1);
+      thread_data_ptr[i].prev_sent = sent;
+      tot_rate += rate;
+      uint32_t spent = thread_data_ptr[i].spent;
+      uint32_t intervalcounter  = thread_data_ptr[i].intervalcounter;
+      uint32_t load = 0;
+      if (intervalcounter - thread_data_ptr[i].prev_intervalcounter > 0) {
+          load = (spent - thread_data_ptr[i].prev_spent) * 100ULL /
+                  (intervalcounter - thread_data_ptr[i].prev_intervalcounter) / global_data_ptr->interval;
+      }
+      ns_t max_drift = thread_data_ptr[i].max_drift;
+      if (max_drift > tot_max_drift)
+          tot_max_drift = max_drift;
+      thread_data_ptr[i].prev_spent = spent;
+      thread_data_ptr[i].prev_intervalcounter = intervalcounter;
+      tot_load += load;
+      printf("%10u | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 " | %6" PRIu64 ".%06" PRIu64 "\n",
+              global_data_ptr->dstport0 + i, sent, rate/1000, rate%1000, load, max_drift/1000000UL, max_drift%1000000UL);
+  }
+  printf("=================================================================\n");
+  printf("     total | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 " | %6" PRIu64 ".%06" PRIu64 "\n",
+      tot_sent, tot_rate/1000, tot_rate%1000, tot_load, tot_max_drift/1000000UL, tot_max_drift%1000000UL);
+  fflush(stdout);
+
+  global_data_ptr->t0 = t1;
+}
+
 int main(int argc, char **argv) {
-    struct global_data global_data = { .dstport0 = 0, .sndbuf = false };
+    struct global_data global_data = { .interval = 1000000ULL };
     global_data_ptr = &global_data;
     
     while (argc > 6) {
         if (!strcmp(argv[1], "--sndbuf")) {
             global_data.sndbuf = true;
+        } else if (!strcmp(argv[1], "-d")) {
+            global_data.daemonize = true;
+        } else if (!strcmp(argv[1], "-i")) {
+            global_data.interval = 1000000ULL * atoi(argv[2]);
+            argv++; argc--;
         } else {
             exit_with_usage();  
         }
@@ -193,8 +258,8 @@ int main(int argc, char **argv) {
         exit_with_usage();
     }
     
-    int N = atoi(argv[4]);
-    if (!N) {
+    global_data.N = atoi(argv[4]);
+    if (!global_data.N) {
         fprintf(stderr, "Not a valid number of TSs: %s\n", argv[4]);
         exit_with_usage();
     }
@@ -206,17 +271,26 @@ int main(int argc, char **argv) {
     }
     global_data.interval = 1000000ULL;
     global_data.bpi = mbps * 125; // * 1M (Mbps -> bps) / 1k (bps -> bpms) / 8 (bpms -> Bpms=bpi)
-    printf("Total TS bitrate: %" PRIu32 " Mbps.\n", mbps * N);
+    global_data.t0 = ns_now();
+    printf("Total TS bitrate: %" PRIu32 " Mbps.\n", mbps * global_data.N);
     printf("UDP pkts per second per TS: %" PRIu64 "\n", (uint64_t)mbps * 1000000 / 8 / 188 / 7);
-    printf("Total UDP pkts per second: %" PRIu64 "\n", (uint64_t)mbps * N * 1000000 / 8 / 188 / 7);
-    printf("Using UDP destination ports %u -> %u.\n", global_data.dstport0, global_data.dstport0 + N - 1);
+    printf("Total UDP pkts per second: %" PRIu64 "\n", (uint64_t)mbps * global_data.N * 1000000 / 8 / 188 / 7);
+    printf("Using UDP destination ports %u -> %u.\n", global_data.dstport0, global_data.dstport0 + global_data.N - 1);
+    time_t now = time(0);
+    printf("Kicked off at %s", ctime(&now));
+    fflush(stdout);
     
-    struct thread_data thread_data[N];
+    struct thread_data thread_data[global_data.N];
     memset(thread_data, 0, sizeof(thread_data));
-    pthread_t thread[N];
-    
-    int i;
-    for (i = 0; i < N; i++) {
+    thread_data_ptr = thread_data;
+
+    if (global_data.daemonize)
+        daemon(1, 1);
+    else
+       report();
+
+    pthread_t thread[global_data.N];
+    for (int i = 0; i < global_data.N; i++) {
         thread_data[i].index = i;
         int err = pthread_create(&thread[i], NULL, run, (void*)&thread_data[i]);
         if (err) {
@@ -224,70 +298,49 @@ int main(int argc, char **argv) {
             exit(1);
         }
     }
-    ns_t t0 = ns_now();
-    
-    printf("      port |       sent | rate(Mbps) |    load(%%) | max_drift(ms)\n");
-    printf("==================================================================\n");
-    for (i = 0; i < N; i++)
-        printf("%10u | %10u | %6" PRIu32 ".%03" PRIu32 " | %10u | %6u.%06u\n", global_data.dstport0 + i, 0, 0, 0, 0, 0, 0);
-    printf("==================================================================\n");
-    printf("     total | %10u | %6" PRIu32 ".%03" PRIu32 " | %10u | %6u.%06u\n", 0, 0, 0, 0, 0, 0);
-    
+
+    signal(SIGUSR1, sighandle);
+    signal(SIGTERM, sighandle);
+    signal(SIGINT, sighandle);
+
     for(;;) {
         int stopped = 0;
-        for (i = 0; i < N; i++)
+        for (int i = 0; i < global_data_ptr->N; i++)
             if (thread_data[i].stopped)
                 stopped++;
-        if (stopped == N)
+        if (stopped == global_data_ptr->N)
             break;
 
         struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
         select(0, NULL, NULL, NULL, &tv);
         
-        printf("\r");
-        for (i = 0; i < N + 2; i++)
-            printf("%s", "\033[A");
-            
-        ns_t t1 = ns_now();
-        ns_t elapsed = t1 - t0;
-
-        uint32_t tot_sent = 0;
-        uint32_t tot_rate = 0;
-        uint32_t tot_load = 0;
-        ns_t tot_max_drift = 0;
-        for (i = 0; i < N; i++) {
-            uint32_t sent = thread_data[i].sent;
-            tot_sent += sent;
-            uint32_t rate = (uint64_t)(sent - thread_data[i].prev_sent) * 7 * 188 * 8 * 1000000 / elapsed;
-            thread_data[i].prev_sent = sent;
-            tot_rate += rate;
-            uint32_t spent = thread_data[i].spent; 
-            uint32_t intervalcounter  = thread_data[i].intervalcounter; 
-            uint32_t load = 0;
-            if (intervalcounter - thread_data[i].prev_intervalcounter > 0) {
-                load = (spent - thread_data[i].prev_spent) * 100ULL / 
-                        (intervalcounter - thread_data[i].prev_intervalcounter) / global_data.interval;
+        if (global_data.signum) {
+            if (global_data.daemonize) {
+              time_t now = time(0);
+              printf("Caught signal %d at %s", global_data.signum, ctime(&now));
             }
-            ns_t max_drift = thread_data[i].max_drift;
-            if (max_drift > tot_max_drift)
-                tot_max_drift = max_drift;
-            thread_data[i].prev_spent = spent;
-            thread_data[i].prev_intervalcounter = intervalcounter;
-            tot_load += load;
-            printf("%10u | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 " | %6" PRIu64 ".%06" PRIu64 "\n",
-                    global_data.dstport0 + i, sent, rate/1000, rate%1000, load, max_drift/1000000UL, max_drift%1000000UL);
+            if (global_data.signum == SIGUSR1) {
+                report();
+            } else {
+                global_data.killed = true;
+                break;
+            }
+            global_data.signum = 0;
         }
-        printf("==================================================\n");
-        printf("     total | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 " | %6" PRIu64 ".%06" PRIu64 "\n",
-            tot_sent, tot_rate/1000, tot_rate%1000, tot_load, tot_max_drift/1000000UL, tot_max_drift%1000000UL);
-           
-        t0 = t1;
+
+        if (!global_data.daemonize)
+            report();
     }
 
-    for (i = 0; i < N; i++) {
+    for (int i = 0; i < global_data.N; i++) {
         pthread_join(thread[i], NULL);
     }
     
+    report();
+
+    now = time(0);
+    printf("Stopped at %s", ctime(&now));
+
     addr_list_cleanup(&global_data.locaddr);
     addr_list_cleanup(&global_data.dstaddr);
     

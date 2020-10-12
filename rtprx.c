@@ -18,13 +18,16 @@
 #include <net/if.h>
 #include <pthread.h>
 #include <sys/prctl.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include "ns.h"
 #include "addr_list.h"
 #include "rtp_window.h"
 
 static void exit_with_usage() {
-    fprintf(stderr, "Usage: rtprx <locips> <dstips> <srcips> <dstport0> <#TSs>\n"); 
+    fprintf(stderr, "Usage: rtprx [-d] [-i <ms>] [-v] <locips> <dstips> <srcips> <dstport0> <#TSs>\n");
     exit(0);
 }
 
@@ -33,6 +36,13 @@ struct global_data {
     struct addr_list dstaddr;
     struct addr_list srcaddr;
     uint16_t dstport0; 
+    bool daemonize;
+    int signum;
+    int killed;
+    int N;
+    ns_t t0;
+    ns_t interval;
+    bool verbose;
 };
 struct global_data* global_data_ptr = NULL;
 
@@ -41,7 +51,13 @@ struct thread_data {
     struct rtp_window rtp_window;
     uint32_t prev_valid;
     bool stopped;
-};
+    uint32_t max_burst;
+} *thread_data_ptr = NULL;
+
+static void sighandle(int signum)
+{
+  global_data_ptr->signum = signum;
+}
 
 static void *run(void *arg) {
     struct thread_data *thread_data_ptr = arg;
@@ -119,6 +135,13 @@ static void *run(void *arg) {
         }
     }
 
+    int flags = fcntl(s, F_GETFL, 0);
+    if (fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+      fprintf(stderr, "fcntl(flags | O_NONBLOCK) failed: %m\n");
+      goto leave;
+    }
+
     uint8_t buf[1500];
     struct iovec iov;
     struct msghdr msg;
@@ -132,13 +155,42 @@ static void *run(void *arg) {
     msg.msg_controllen = 0;
     msg.msg_flags = 0;
 
-    for (;;) {
-        if (recvmsg(s, &msg, 0) <= 0) {
-            fprintf(stderr, "recvmsg() failed for port %u: %m\n", dstport);
-            goto leave;
+    ns_t t = ns_now();
+
+    for (;!global_data_ptr->killed;) {
+        uint32_t burst = 0;
+        for (;;) {
+          int n = recvmsg(s, &msg, 0);
+          if (n <= 0) {
+              if (errno == EWOULDBLOCK) {
+                  break;
+              } else {
+                  fprintf(stderr, "recvmsg() failed for port %u: %m\n", dstport);
+                  goto leave;
+              }
+          }
+          uint16_t seqnr = buf[2] << 8 | buf[3];
+          int16_t diff = seqnr - thread_data_ptr->rtp_window.seqnr;
+          if (global_data_ptr->verbose && !thread_data_ptr->rtp_window.firstpkt && diff != 0) {
+            time_t now = time(0);
+            char nowstr[26];
+            printf("Port %d expected seqnr %d but got %d at %s",
+                dstport, thread_data_ptr->rtp_window.seqnr, seqnr, ctime_r(&now, nowstr));
+            fflush(stdout);
+          }
+          rtp_window_push(&thread_data_ptr->rtp_window, seqnr);
+          burst++;
         }
-        uint16_t seqnr = buf[2] << 8 | buf[3];
-        rtp_window_push(&thread_data_ptr->rtp_window, seqnr);
+        ns_t t1 = ns_now();
+
+        t += global_data_ptr->interval;
+        if (burst > thread_data_ptr->max_burst) thread_data_ptr->max_burst = burst;
+
+        if (t >= t1 + 1000) {
+            struct timeval tv;
+            ns_totimeval(t - t1, &tv);
+            select(0, NULL, NULL, NULL, &tv);
+        }
     }
 leave:
     if (s > 0)
@@ -147,11 +199,87 @@ leave:
     return NULL;
 }
 
+static void report()
+{
+  static bool reported = false;
+
+  if (!reported || global_data_ptr->daemonize) {
+      reported = true;
+  } else {
+      printf("\r");
+      for (int i = 0; i < global_data_ptr->N + 4; i++)
+          printf("%s", "\033[A");
+  }
+
+  printf("      port |      valid |    missing |  reordered |  duplicate |      reset | rate(Mbps) |  max_burst\n");
+  printf("=====================================================================================================\n");
+
+  ns_t t1 = ns_now();
+  ns_t elapsed = t1 - global_data_ptr->t0;
+
+  struct rtp_window tot_window;
+  rtp_window_init(&tot_window);
+  uint32_t tot_rate = 0;
+  uint32_t max_burst = 0;
+
+  for (int i = 0; i < global_data_ptr->N; i++) {
+      uint32_t valid = thread_data_ptr[i].rtp_window.valid;
+      uint32_t rate = (uint64_t)(valid - thread_data_ptr[i].prev_valid) * 7 * 188 * 8 * 1000000 / elapsed;
+      thread_data_ptr[i].prev_valid = valid;
+      printf("%10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n",
+              global_data_ptr->dstport0 + i,
+              thread_data_ptr[i].rtp_window.valid,
+              thread_data_ptr[i].rtp_window.missing,
+              thread_data_ptr[i].rtp_window.reordered,
+              thread_data_ptr[i].rtp_window.duplicate,
+              thread_data_ptr[i].rtp_window.reset,
+              rate / 1000, rate % 1000,
+              thread_data_ptr[i].max_burst);
+      tot_window.valid += thread_data_ptr[i].rtp_window.valid;
+      tot_window.missing += thread_data_ptr[i].rtp_window.missing;
+      tot_window.reordered += thread_data_ptr[i].rtp_window.reordered;
+      tot_window.duplicate += thread_data_ptr[i].rtp_window.duplicate;
+      tot_window.reset += thread_data_ptr[i].rtp_window.reset;
+      if (thread_data_ptr[i].max_burst > max_burst) max_burst = thread_data_ptr[i].max_burst;
+      tot_rate += rate;
+  }
+  printf("=====================================================================================================\n");
+  printf("     total | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n",
+          tot_window.valid,
+          tot_window.missing,
+          tot_window.reordered,
+          tot_window.duplicate,
+          tot_window.reset,
+          tot_rate / 1000, tot_rate % 1000,
+          max_burst);
+  fflush(stdout);
+
+  global_data_ptr->t0 = t1;
+}
+
 int main(int argc, char **argv) {
-    struct global_data global_data = { .dstport0 = 0 };
+    struct global_data global_data = { .interval = 10000000ULL };
     global_data_ptr = &global_data;
 
+    while (argc > 6) {
+        if (!strcmp(argv[1], "-d")) {
+            global_data.daemonize = true;
+        } else if (!strcmp(argv[1], "-v")) {
+            global_data.verbose = true;
+        } else if (!strcmp(argv[1], "-i")) {
+            global_data.interval = 1000000ULL * atoi(argv[2]);
+            argv++; argc--;
+        } else {
+            exit_with_usage();
+        }
+        argv++;
+        argc--;
+    }
+
     if (argc != 6) 
+        exit_with_usage();
+
+    if (argc != 6)
         exit_with_usage();
     
     if (addr_list_parse(&global_data.locaddr, argv[1]))
@@ -169,18 +297,27 @@ int main(int argc, char **argv) {
         exit_with_usage();
     }
     
-    int N = atoi(argv[5]);
-    if (!N) {
+    global_data.N = atoi(argv[5]);
+    if (!global_data.N) {
         fprintf(stderr, "Not a valid number of TSs: %s\n", argv[5]);
         exit_with_usage();
     }
     
-    struct thread_data thread_data[N];
+    struct thread_data thread_data[global_data.N];
     memset(thread_data, 0, sizeof(thread_data));
-    pthread_t thread[N];
-    
-    int i;
-    for (i = 0; i < N; i++) {
+    thread_data_ptr = thread_data;
+    global_data.t0 = ns_now();
+    time_t now = time(0);
+    printf("Kicked off at %s", ctime(&now));
+    fflush(stdout);
+
+    if (global_data.daemonize)
+        daemon(1, 1);
+    else
+       report();
+
+    pthread_t thread[global_data.N];
+    for (int i = 0; i < global_data.N; i++) {
         thread_data[i].stopped = false;
         thread_data[i].index = i;
         rtp_window_init(&thread_data[i].rtp_window);
@@ -190,75 +327,48 @@ int main(int argc, char **argv) {
             exit(1);
         }
     }
-    
-    ns_t t0 = ns_now();
 
-    printf("      port |      valid |    missing |  reordered |  duplicate |      reset | rate(Mbps)\n");
-    printf("=========================================================================================\n");
-    for (i = 0; i < N; i++)
-        printf("%10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 "\n", 
-        global_data.dstport0 + i, 0, 0, 0, 0, 0, 0, 0);
-    printf("=========================================================================================\n");
-    printf("     total | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 "\n", 
-        0, 0, 0, 0, 0, 0, 0);
+    signal(SIGUSR1, sighandle);
+    signal(SIGTERM, sighandle);
+    signal(SIGINT, sighandle);
 
-    
     for(;;) {
         int stopped = 0;
-        for (i = 0; i < N; i++)
+        for (int i = 0; i < global_data.N; i++)
             if (thread_data[i].stopped)
                 stopped++;
-        if (stopped == N)
+        if (stopped == global_data.N)
             break;
 
         struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
         select(0, NULL, NULL, NULL, &tv);
         
-        printf("\r");
-        for (i = 0; i < N + 2; i++)
-            printf("%s", "\033[A");
-            
-        ns_t t1 = ns_now();
-        ns_t elapsed = t1 - t0;
-
-        struct rtp_window tot_window;
-        rtp_window_init(&tot_window);
-        uint32_t tot_rate = 0;
-
-        for (i = 0; i < N; i++) {
-            uint32_t valid = thread_data[i].rtp_window.valid;
-            uint32_t rate = (uint64_t)(valid - thread_data[i].prev_valid) * 7 * 188 * 8 * 1000000 / elapsed;
-            thread_data[i].prev_valid = valid;
-            printf("%10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 "\n", 
-                    global_data.dstport0 + i, 
-                    thread_data[i].rtp_window.valid,
-                    thread_data[i].rtp_window.missing,
-                    thread_data[i].rtp_window.reordered,
-                    thread_data[i].rtp_window.duplicate,
-                    thread_data[i].rtp_window.reset,
-                    rate / 1000, rate % 1000);
-            tot_window.valid += thread_data[i].rtp_window.valid;
-            tot_window.missing += thread_data[i].rtp_window.missing;
-            tot_window.reordered += thread_data[i].rtp_window.reordered;
-            tot_window.duplicate += thread_data[i].rtp_window.duplicate;
-            tot_window.reset += thread_data[i].rtp_window.reset;
-            tot_rate += rate;
+        if (global_data.signum) {
+            if (global_data.daemonize) {
+              time_t now = time(0);
+              printf("Caught signal %d at %s", global_data.signum, ctime(&now));
+            }
+            if (global_data.signum == SIGUSR1) {
+                report();
+            } else {
+                global_data.killed = true;
+                break;
+            }
+            global_data.signum = 0;
         }
-        printf("=========================================================================================\n");
-        printf("     total | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 "\n", 
-                tot_window.valid,
-                tot_window.missing,
-                tot_window.reordered,
-                tot_window.duplicate,
-                tot_window.reset,
-                tot_rate / 1000, tot_rate % 1000);
-                
-        t0 = t1;   
+
+        if (!global_data.daemonize)
+            report();
     }
 
-    for (i = 0; i < N; i++)
+    for (int i = 0; i < global_data.N; i++)
         pthread_join(thread[i], NULL);
     
+    report();
+
+    now = time(0);
+    printf("Stopped at %s", ctime(&now));
+
     return 0;
 }
 
