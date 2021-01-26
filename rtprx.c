@@ -21,13 +21,14 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/mman.h>
 
 #include "ns.h"
 #include "addr_list.h"
 #include "rtp_window.h"
 
 static void exit_with_usage() {
-    fprintf(stderr, "Usage: rtprx [-d] [-i <ms>] [-v] <locips> <dstips> <srcips> <dstport0> <#TSs>\n");
+    fprintf(stderr, "Usage: rtprx [--netmap <devs> [--rxonly]] [-d] [-i <us>] [-v] <locips> <dstips> <srcips> <dstport0> <#TSs>\n");
     exit(0);
 }
 
@@ -43,25 +44,81 @@ struct global_data {
     ns_t t0;
     ns_t interval;
     bool verbose;
+    bool rxonly;
+    struct str_list netmap_dev;
 };
-struct global_data* global_data_ptr = NULL;
+struct global_data* globptr = NULL;
 
-struct thread_data {
+struct ts_data {
     int index;
     struct rtp_window rtp_window;
     uint32_t prev_valid;
-    bool stopped;
     uint32_t max_burst;
-} *thread_data_ptr = NULL;
+    bool running;
+} *tsptr0 = NULL;
 
 static void sighandle(int signum)
 {
-  global_data_ptr->signum = signum;
+  globptr->signum = signum;
+}
+
+static void handle_udp_packet(struct ts_data* tsptr, const uint8_t* pkt) {
+    uint16_t seqnr = pkt[2] << 8 | pkt[3];
+    int16_t diff = seqnr - tsptr->rtp_window.seqnr;
+    if (globptr->verbose && !tsptr->rtp_window.firstpkt && diff != 0) {
+        time_t now = time(0);
+        char nowstr[26];
+        printf("Port %d expected seqnr %d but got %d at %s",
+            globptr->dstport0 + (int)(tsptr - tsptr0), tsptr->rtp_window.seqnr, seqnr, ctime_r(&now, nowstr));
+        fflush(stdout);
+    }
+    rtp_window_push(&tsptr->rtp_window, seqnr);
+}
+
+static int join_mcast(int fd, struct sockaddr_in* dstaddr, struct sockaddr_in* locaddr, struct sockaddr_in* srcaddr)
+{
+    if (srcaddr->sin_addr.s_addr == INADDR_ANY)
+    { // -> EXCLUDE(), a.k.a. non-source specific multicast
+        struct ip_mreq mreq;
+        mreq.imr_multiaddr = dstaddr->sin_addr;
+        mreq.imr_interface = locaddr->sin_addr;
+
+        if (setsockopt(fd, SOL_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) {
+            char dstaddrbuf[20];
+            char locaddrbuf[20];
+
+            fprintf(stderr, "setsockopt(IP_ADD_MEMBERSHIP, %s@%s:EX()) failed: %m\n",
+                    inet_ntop(dstaddr->sin_family, &dstaddr->sin_addr, dstaddrbuf, sizeof(dstaddrbuf)),
+                    inet_ntop(locaddr->sin_family, &locaddr->sin_addr, locaddrbuf, sizeof(locaddrbuf)));
+            return -1;
+        }
+    }
+    else
+    { // -> INCLUDE(srcaddr), a.k.a. source specific multicast
+        struct ip_mreq_source mreq;
+        mreq.imr_multiaddr = dstaddr->sin_addr;
+        mreq.imr_interface = locaddr->sin_addr;
+        mreq.imr_sourceaddr = srcaddr->sin_addr;
+
+        if (setsockopt(fd, SOL_IP, IP_ADD_SOURCE_MEMBERSHIP, &mreq, sizeof(mreq))) {
+            char dstaddrbuf[20];
+            char locaddrbuf[20];
+            char srcaddrbuf[20];
+
+            fprintf(stderr, "setsockopt(IP_ADD_SOURCE_MEMBERSHIP, %s@%s:IN(%s)) failed: %m\n",
+                    inet_ntop(dstaddr->sin_family, &dstaddr->sin_addr, dstaddrbuf, sizeof(dstaddrbuf)),
+                    inet_ntop(locaddr->sin_family, &locaddr->sin_addr, locaddrbuf, sizeof(locaddrbuf)),
+                    inet_ntop(srcaddr->sin_family, &srcaddr->sin_addr, srcaddrbuf, sizeof(srcaddrbuf)));
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static void *run(void *arg) {
-    struct thread_data *thread_data_ptr = arg;
-    uint16_t dstport = global_data_ptr->dstport0 + thread_data_ptr->index;
+    struct ts_data *tsptr = arg;
+    int index = tsptr - tsptr0;
+    uint16_t dstport = globptr->dstport0 + index;
 
     char threadname[16];
     sprintf(threadname, "%s:%u", "rtprx", dstport);
@@ -79,7 +136,7 @@ static void *run(void *arg) {
                 bufsize, dstport);
     }
     
-    struct sockaddr_in dstaddr = *addr_list_get(&global_data_ptr->dstaddr, thread_data_ptr->index);
+    struct sockaddr_in dstaddr = *addr_list_get(&globptr->dstaddr, index);
     dstaddr.sin_port = htons(dstport);
 
     if (bind(s, (struct sockaddr *)&dstaddr, sizeof(dstaddr)))
@@ -92,47 +149,9 @@ static void *run(void *arg) {
     
     uint8_t *dstip = (uint8_t *)&dstaddr.sin_addr;
     if ((dstip[0] & 0xf0) == 0xe0) {
-        struct sockaddr_in* locaddr = addr_list_get(&global_data_ptr->locaddr, thread_data_ptr->index);
-        struct sockaddr_in* srcaddr = addr_list_get(&global_data_ptr->srcaddr, thread_data_ptr->index);
-        
-        if (srcaddr->sin_addr.s_addr == INADDR_ANY)
-        { // -> EXCLUDE(), a.k.a. non-source specific multicast
-          struct ip_mreq mreq;
-          mreq.imr_multiaddr = dstaddr.sin_addr;
-          mreq.imr_interface = locaddr->sin_addr;
-
-          if (setsockopt(s, SOL_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) {
-              char dstaddrbuf[20];
-              char locaddrbuf[20];
-
-              fprintf(stderr, "setsockopt(IP_ADD_MEMBERSHIP, %s@%s:EX()) failed for port %u: %m\n",
-                      inet_ntop(dstaddr.sin_family, &dstaddr.sin_addr, dstaddrbuf, sizeof(dstaddrbuf)),
-                      inet_ntop(locaddr->sin_family, &locaddr->sin_addr, locaddrbuf, sizeof(locaddrbuf)),
-                      dstport);
-              goto leave;
-          }
-        }
-        else
-        { // -> INCLUDE(srcaddr), a.k.a. source specific multicast
-          struct ip_mreq_source mreq;
-          mreq.imr_multiaddr = dstaddr.sin_addr;
-          mreq.imr_interface = locaddr->sin_addr;
-          mreq.imr_sourceaddr = srcaddr->sin_addr;
-
-          if (setsockopt(s, SOL_IP, IP_ADD_SOURCE_MEMBERSHIP, &mreq, sizeof(mreq))) {
-              char dstaddrbuf[20];
-              char locaddrbuf[20];
-              char srcaddrbuf[20];
-
-              fprintf(stderr, "setsockopt(IP_ADD_SOURCE_MEMBERSHIP, %s@%s:IN(%s)) failed for port %u: %m\n",
-                      inet_ntop(dstaddr.sin_family, &dstaddr.sin_addr, dstaddrbuf, sizeof(dstaddrbuf)),
-                      inet_ntop(locaddr->sin_family, &locaddr->sin_addr, locaddrbuf, sizeof(locaddrbuf)),
-                      inet_ntop(srcaddr->sin_family, &srcaddr->sin_addr, srcaddrbuf, sizeof(srcaddrbuf)),
-                      dstport);
-              goto leave;
-
-          }
-        }
+        if (join_mcast(s, &dstaddr, addr_list_get(&globptr->locaddr, index),
+                                    addr_list_get(&globptr->srcaddr, index)) < 0)
+            goto leave;
     }
 
     int flags = fcntl(s, F_GETFL, 0);
@@ -157,7 +176,7 @@ static void *run(void *arg) {
 
     ns_t t = ns_now();
 
-    for (;!global_data_ptr->killed;) {
+    for (;!globptr->killed;) {
         uint32_t burst = 0;
         for (;;) {
           int n = recvmsg(s, &msg, 0);
@@ -169,22 +188,13 @@ static void *run(void *arg) {
                   goto leave;
               }
           }
-          uint16_t seqnr = buf[2] << 8 | buf[3];
-          int16_t diff = seqnr - thread_data_ptr->rtp_window.seqnr;
-          if (global_data_ptr->verbose && !thread_data_ptr->rtp_window.firstpkt && diff != 0) {
-            time_t now = time(0);
-            char nowstr[26];
-            printf("Port %d expected seqnr %d but got %d at %s",
-                dstport, thread_data_ptr->rtp_window.seqnr, seqnr, ctime_r(&now, nowstr));
-            fflush(stdout);
-          }
-          rtp_window_push(&thread_data_ptr->rtp_window, seqnr);
+          handle_udp_packet(tsptr, buf);
           burst++;
         }
         ns_t t1 = ns_now();
 
-        t += global_data_ptr->interval;
-        if (burst > thread_data_ptr->max_burst) thread_data_ptr->max_burst = burst;
+        t += globptr->interval;
+        if (burst > tsptr->max_burst) tsptr->max_burst = burst;
 
         if (t >= t1 + 1000) {
             struct timeval tv;
@@ -195,80 +205,316 @@ static void *run(void *arg) {
 leave:
     if (s > 0)
         close(s);
-    thread_data_ptr->stopped = true;
+    tsptr->running = false;
     return NULL;
 }
 
+#define NETMAP
+#ifdef NETMAP
+
+#include <net/netmap.h>
+#include <net/netmap_user.h>
+
+#include <net/ethernet.h>
+#include <netinet/udp.h>
+#include <netinet/ip.h>
+
+struct vlan_header {
+    uint16_t tag;
+    uint16_t ether_type;
+};
+
+static void* run_netmap(void* arg)
+{
+    struct ts_data* threadptr = (struct ts_data*)arg;
+    int index = threadptr - tsptr0;
+    int step = globptr->netmap_dev.size;
+
+    const char* dev = str_list_get(&globptr->netmap_dev, index);
+
+    char threadname[16];
+    sprintf(threadname, "%s:%s", "rtprx", dev);
+    prctl(PR_SET_NAME, threadname, 0, 0, 0);
+
+    struct nmreq_register reg = {
+        .nr_mode = NR_REG_NIC_SW,
+    };
+    struct nmreq_header hdr = {
+        .nr_version = NETMAP_API,
+        .nr_reqtype = NETMAP_REQ_REGISTER,
+        .nr_body    = (uint64_t)&reg,
+    };
+    void *mem = MAP_FAILED;
+    int fd = -1;
+    int igmpfd = - 1;
+
+    fd = open("/dev/netmap", O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "open(/dev/netmap) failed: %m\n");
+        goto leave;
+    }
+
+    snprintf(hdr.nr_name, NETMAP_REQ_IFNAMSIZ, "%s", dev);
+    if (ioctl(fd, NIOCCTRL, &hdr) < 0) {
+        fprintf(stderr, "ioctl(/dev/netmap, NIOCCTRL, {type=NETMAP_REQ_REGISTER, port=%s}) failed: %m\n", dev);
+        goto leave;
+    }
+
+    mem = mmap(NULL, reg.nr_memsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) {
+        fprintf(stderr, "mmap(/dev/netmap) failed: %m\n");
+        goto leave;
+    }
+    struct netmap_if *ifp = NETMAP_IF(mem, reg.nr_offset);
+
+    igmpfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (igmpfd < 0) {
+        fprintf(stderr, "socket() failed: %m\n");
+        goto leave;
+    }
+    int memberships = globptr->dstaddr.size;
+    if (memberships < globptr->srcaddr.size)
+        memberships = globptr->srcaddr.size;
+    for (int i = index; i < memberships; i += step)
+    {
+        struct sockaddr_in dstaddr = *addr_list_get(&globptr->dstaddr, i);
+        uint8_t *dstip = (uint8_t *)&dstaddr.sin_addr;
+        if ((dstip[0] & 0xf0) == 0xe0) {
+            if (join_mcast(igmpfd, &dstaddr, addr_list_get(&globptr->locaddr, i),
+                                             addr_list_get(&globptr->srcaddr, i)) < 0)
+                goto leave;
+        }
+    }
+
+    ns_t t = ns_now();
+    bool first = true;
+
+    for (;!globptr->killed;) {
+
+        if (ioctl(fd, NIOCRXSYNC, NULL) < 0) {
+            fprintf(stderr, "ioctl(/dev/netmap, NIOCRXSYNC) failed: %m\n");
+            goto leave;
+        }
+
+        // from nic rx ring to rtp window or to host rx ring
+        uint32_t burst = 0;
+        for (uint32_t rxringi = 0; rxringi < ifp->ni_rx_rings; rxringi++) {
+            struct netmap_ring* rxringp = NETMAP_RXRING(ifp, rxringi);
+            struct netmap_ring* txringp = NETMAP_TXRING(ifp, ifp->ni_tx_rings + rxringi % ifp->ni_host_tx_rings);
+            uint32_t rxhead = rxringp->head, rxtail = rxringp->tail;
+            uint32_t txhead = txringp->head, txtail = txringp->tail;
+
+            for (; rxhead != rxtail; rxhead = nm_ring_next(rxringp, rxhead)) {
+                burst++;
+                struct netmap_slot* rxslotp = &rxringp->slot[rxhead];
+                const uint8_t* pkt = (const uint8_t*)NETMAP_BUF(rxringp, rxslotp->buf_idx);
+                const uint8_t* pktend = pkt + rxslotp->len;
+
+                bool handled = false;
+                do {
+                    if (rxslotp->flags & NS_MOREFRAG) break; // don't support this.
+
+                    const struct ether_header* eth = (const struct ether_header*)pkt;
+                    pkt += sizeof(struct ether_header);
+                    if (pkt > pktend) break;
+                    uint16_t ether_type = ntohs(eth->ether_type);
+
+                    if (ether_type == ETH_P_8021Q) {
+                        const struct vlan_header* vlan = (const struct vlan_header*)pkt;
+                        pkt += sizeof(struct vlan_header);
+                        if (pkt > pktend) break;
+                        ether_type = ntohs(vlan->ether_type);
+                    }
+
+                    if (ether_type != ETH_P_IP) break;
+
+                    const struct iphdr* ip = (const struct iphdr*)pkt;
+                    if (pkt + sizeof(struct iphdr) > pktend) break;
+                    pkt += ip->ihl * 4;
+                    if (pkt > pktend) continue;
+
+                    //printf("PKT %08x -> %08x\n", ntohl(ip->saddr), ntohl(ip->daddr));
+
+                    if (ip->protocol != IPPROTO_UDP) break;
+                    if (ntohs(ip->frag_off) & 0x1fff) break;
+
+                    const struct udphdr* udp = (const struct udphdr*)pkt;
+                    pkt += sizeof(struct udphdr);
+                    if (pkt > pktend) break;
+
+                    uint16_t dstport = ntohs(udp->dest);
+                    int tsindex = dstport - globptr->dstport0;
+                    if (tsindex < 0 || tsindex >= globptr->N) break;
+                    if (tsindex % step != index) break;
+                    struct ts_data* tsptr = &tsptr0[tsindex];
+
+                    handled = true;
+
+                    if (!first) handle_udp_packet(tsptr, pkt);
+
+                } while (false);
+
+                if (handled) continue;
+
+                if (txhead == txtail) continue; // this is packet drop
+
+                struct netmap_slot* txslotp = &txringp->slot[txhead];
+                struct netmap_slot tmp = *txslotp;
+                *txslotp = *rxslotp;
+                *rxslotp = tmp;
+                txslotp->flags |= NS_BUF_CHANGED;
+                rxslotp->flags |= NS_BUF_CHANGED;
+                txhead = nm_ring_next(txringp, txhead);
+            }
+            rxringp->head = rxringp->cur = rxhead;
+            txringp->head = txringp->cur = txhead;
+        }
+        if (burst > threadptr->max_burst) threadptr->max_burst = burst;
+
+        if (!globptr->rxonly) {
+            // From host rx ring to nic tx ring
+            for (uint32_t rxringi = 0; rxringi < ifp->ni_host_rx_rings; rxringi++) {
+                struct netmap_ring* rxringp = NETMAP_RXRING(ifp, ifp->ni_rx_rings + rxringi);
+                struct netmap_ring* txringp = NETMAP_TXRING(ifp, rxringi % ifp->ni_tx_rings);
+                uint32_t rxhead = rxringp->head, rxtail = rxringp->tail;
+                uint32_t txhead = txringp->head, txtail = txringp->tail;
+
+                for (; rxhead != rxtail; rxhead = nm_ring_next(rxringp, rxhead)) {
+                    struct netmap_slot* rxslotp = &rxringp->slot[rxhead];
+
+                    if (txhead == txtail) continue; // this is packet drop
+
+                    struct netmap_slot* txslotp = &txringp->slot[txhead];
+                    struct netmap_slot tmp = *txslotp;
+                    *txslotp = *rxslotp;
+                    *rxslotp = tmp;
+                    txslotp->flags |= NS_BUF_CHANGED;
+                    rxslotp->flags |= NS_BUF_CHANGED;
+                    txhead = nm_ring_next(txringp, txhead);
+                }
+                rxringp->head = rxringp->cur = rxhead;
+                txringp->head = txringp->cur = txhead;
+            }
+        }
+
+        if (ioctl(fd, NIOCTXSYNC, NULL) < 0) {
+            fprintf(stderr, "ioctl(/dev/netmap, NIOCTXSYNC) failed: %m\n");
+            goto leave;
+        }
+
+        ns_t t1 = ns_now();
+
+        t += globptr->interval;
+
+        if (t >= t1 + 1000) {
+            struct timeval tv;
+            ns_totimeval(t - t1, &tv);
+            select(0, NULL, NULL, NULL, &tv);
+        }
+
+        first = false;
+    }
+
+leave:
+    if (mem != MAP_FAILED)
+        munmap(mem, reg.nr_memsize);
+    if (igmpfd > 0)
+        close(igmpfd);
+    if (fd > 0)
+        close(fd);
+    threadptr->running = false;
+    return NULL;
+}
+
+#else
+
+static void* run_netmap(void* arg)
+{
+  struct thread_data *threadptr = arg;
+  fprintf(stderr, "Netmap support was disabled at compile time. Exiting...\n");
+  threadptr->running = false;
+  return NULL;
+}
+
+#endif
+
 static void report()
 {
-  static bool reported = false;
+    static bool reported = false;
 
-  if (!reported || global_data_ptr->daemonize) {
-      reported = true;
-  } else {
-      printf("\r");
-      for (int i = 0; i < global_data_ptr->N + 4; i++)
-          printf("%s", "\033[A");
-  }
+    if (!reported || globptr->daemonize) {
+        reported = true;
+    } else {
+        printf("\r");
+        for (int i = 0; i < globptr->N + 4; i++)
+            printf("%s", "\033[A");
+    }
 
-  printf("      port |      valid |    missing |  reordered |  duplicate |      reset | rate(Mbps) |  max_burst\n");
-  printf("=====================================================================================================\n");
+    printf("      port |      valid |    missing |  reordered |  duplicate |      reset | rate(Mbps) |  max_burst\n");
+    printf("=====================================================================================================\n");
 
-  ns_t t1 = ns_now();
-  ns_t elapsed = t1 - global_data_ptr->t0;
+    ns_t t1 = ns_now();
+    ns_t elapsed = t1 - globptr->t0;
 
-  struct rtp_window tot_window;
-  rtp_window_init(&tot_window);
-  uint32_t tot_rate = 0;
-  uint32_t max_burst = 0;
+    struct rtp_window tot_window;
+    rtp_window_init(&tot_window);
+    uint32_t tot_rate = 0;
+    uint32_t max_burst = 0;
 
-  for (int i = 0; i < global_data_ptr->N; i++) {
-      uint32_t valid = thread_data_ptr[i].rtp_window.valid;
-      uint32_t rate = (uint64_t)(valid - thread_data_ptr[i].prev_valid) * 7 * 188 * 8 * 1000000 / elapsed;
-      thread_data_ptr[i].prev_valid = valid;
-      printf("%10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n",
-              global_data_ptr->dstport0 + i,
-              thread_data_ptr[i].rtp_window.valid,
-              thread_data_ptr[i].rtp_window.missing,
-              thread_data_ptr[i].rtp_window.reordered,
-              thread_data_ptr[i].rtp_window.duplicate,
-              thread_data_ptr[i].rtp_window.reset,
-              rate / 1000, rate % 1000,
-              thread_data_ptr[i].max_burst);
-      tot_window.valid += thread_data_ptr[i].rtp_window.valid;
-      tot_window.missing += thread_data_ptr[i].rtp_window.missing;
-      tot_window.reordered += thread_data_ptr[i].rtp_window.reordered;
-      tot_window.duplicate += thread_data_ptr[i].rtp_window.duplicate;
-      tot_window.reset += thread_data_ptr[i].rtp_window.reset;
-      if (thread_data_ptr[i].max_burst > max_burst) max_burst = thread_data_ptr[i].max_burst;
-      tot_rate += rate;
-  }
-  printf("=====================================================================================================\n");
-  printf("     total | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n",
-          tot_window.valid,
-          tot_window.missing,
-          tot_window.reordered,
-          tot_window.duplicate,
-          tot_window.reset,
-          tot_rate / 1000, tot_rate % 1000,
-          max_burst);
-  fflush(stdout);
+    for (int i = 0; i < globptr->N; i++) {
+        uint32_t valid = tsptr0[i].rtp_window.valid;
+        uint32_t rate = (uint64_t)(valid - tsptr0[i].prev_valid) * 7 * 188 * 8 * 1000000 / elapsed;
+        tsptr0[i].prev_valid = valid;
+        printf("%10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n",
+                globptr->dstport0 + i,
+                tsptr0[i].rtp_window.valid,
+                tsptr0[i].rtp_window.missing,
+                tsptr0[i].rtp_window.reordered,
+                tsptr0[i].rtp_window.duplicate,
+                tsptr0[i].rtp_window.reset,
+                rate / 1000, rate % 1000,
+                tsptr0[i].max_burst);
+        tot_window.valid += tsptr0[i].rtp_window.valid;
+        tot_window.missing += tsptr0[i].rtp_window.missing;
+        tot_window.reordered += tsptr0[i].rtp_window.reordered;
+        tot_window.duplicate += tsptr0[i].rtp_window.duplicate;
+        tot_window.reset += tsptr0[i].rtp_window.reset;
+        if (tsptr0[i].max_burst > max_burst) max_burst = tsptr0[i].max_burst;
+        tot_rate += rate;
+    }
+    printf("=====================================================================================================\n");
+    printf("     total | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n",
+            tot_window.valid,
+            tot_window.missing,
+            tot_window.reordered,
+            tot_window.duplicate,
+            tot_window.reset,
+            tot_rate / 1000, tot_rate % 1000,
+            max_burst);
+    fflush(stdout);
 
-  global_data_ptr->t0 = t1;
+    globptr->t0 = t1;
 }
 
 int main(int argc, char **argv) {
-    struct global_data global_data = { .interval = 10000000ULL };
-    global_data_ptr = &global_data;
+    struct global_data glob = { .interval = 10000000ULL };
+    bool netmap = false;
+    globptr = &glob;
 
     while (argc > 6) {
         if (!strcmp(argv[1], "-d")) {
-            global_data.daemonize = true;
+            glob.daemonize = true;
         } else if (!strcmp(argv[1], "-v")) {
-            global_data.verbose = true;
+            glob.verbose = true;
         } else if (!strcmp(argv[1], "-i")) {
-            global_data.interval = 1000000ULL * atoi(argv[2]);
+            glob.interval = 1000ULL * atoi(argv[2]);
             argv++; argc--;
+        } else if (!strcmp(argv[1], "--netmap")) {
+            str_list_parse(&glob.netmap_dev, argv[2]);
+            netmap = true;
+            argv++; argc--;
+        } else if (!strcmp(argv[1], "--rxonly")) {
+            glob.rxonly = true;
         } else {
             exit_with_usage();
         }
@@ -282,92 +528,112 @@ int main(int argc, char **argv) {
     if (argc != 6)
         exit_with_usage();
     
-    if (addr_list_parse(&global_data.locaddr, argv[1]))
+    if (addr_list_parse(&glob.locaddr, argv[1]))
         exit_with_usage();
 
-    if (addr_list_parse(&global_data.dstaddr, argv[2]))
+    if (addr_list_parse(&glob.dstaddr, argv[2]))
         exit_with_usage();
 
-    if (addr_list_parse(&global_data.srcaddr, argv[3]))
+    if (addr_list_parse(&glob.srcaddr, argv[3]))
         exit_with_usage();
     
-    global_data.dstport0 = atoi(argv[4]);
-    if (!global_data.dstport0) {
+    glob.dstport0 = atoi(argv[4]);
+    if (!glob.dstport0) {
         fprintf(stderr, "Not a valid UDP port number: %s\n", argv[4]);
         exit_with_usage();
     }
     
-    global_data.N = atoi(argv[5]);
-    if (!global_data.N) {
+    glob.N = atoi(argv[5]);
+    if (!glob.N) {
         fprintf(stderr, "Not a valid number of TSs: %s\n", argv[5]);
         exit_with_usage();
     }
     
-    struct thread_data thread_data[global_data.N];
-    memset(thread_data, 0, sizeof(thread_data));
-    thread_data_ptr = thread_data;
-    global_data.t0 = ns_now();
+    struct ts_data ts[glob.N];
+    memset(ts, 0, sizeof(ts));
+    for (int i = 0; i < glob.N; i++) {
+        rtp_window_init(&ts[i].rtp_window);
+    }
+    tsptr0 = ts;
+    glob.t0 = ns_now();
     time_t now = time(0);
     printf("Kicked off at %s", ctime(&now));
     fflush(stdout);
 
-    if (global_data.daemonize)
-        daemon(1, 1);
-    else
-       report();
+    if (glob.daemonize)
+       daemon(1, 1);
 
-    pthread_t thread[global_data.N];
-    for (int i = 0; i < global_data.N; i++) {
-        thread_data[i].stopped = false;
-        thread_data[i].index = i;
-        rtp_window_init(&thread_data[i].rtp_window);
-        int err = pthread_create(&thread[i], NULL, run, &thread_data[i]);
-        if (err) {
-            fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
-            exit(1);
+    int threads = glob.N;
+    if (netmap && threads > glob.netmap_dev.size) threads = glob.netmap_dev.size;
+    pthread_t thread[threads];
+    if (netmap) {
+        for (int i = 0; i < glob.netmap_dev.size; i++) {
+            ts[i].running = true;
+            int err = pthread_create(&thread[i], NULL, run_netmap, &ts[i]);
+            if (err) {
+                fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
+                exit(1);
+            }
+        }
+    } else {
+        for (int i = 0; i < glob.N; i++) {
+            ts[i].running = true;
+            int err = pthread_create(&thread[i], NULL, run, &ts[i]);
+            if (err) {
+                fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
+                exit(1);
+            }
         }
     }
+
+    if (!glob.daemonize)
+        report();
 
     signal(SIGUSR1, sighandle);
     signal(SIGTERM, sighandle);
     signal(SIGINT, sighandle);
 
     for(;;) {
-        int stopped = 0;
-        for (int i = 0; i < global_data.N; i++)
-            if (thread_data[i].stopped)
-                stopped++;
-        if (stopped == global_data.N)
+        int running = 0;
+        for (int i = 0; i < threads; i++)
+            if (ts[i].running)
+                running++;
+        if (!running)
             break;
 
         struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
         select(0, NULL, NULL, NULL, &tv);
         
-        if (global_data.signum) {
-            if (global_data.daemonize) {
-              time_t now = time(0);
-              printf("Caught signal %d at %s", global_data.signum, ctime(&now));
+        if (glob.signum) {
+            if (glob.daemonize) {
+               time_t now = time(0);
+               printf("Caught signal %d at %s", glob.signum, ctime(&now));
             }
-            if (global_data.signum == SIGUSR1) {
+            if (glob.signum == SIGUSR1) {
                 report();
             } else {
-                global_data.killed = true;
+                glob.killed = true;
                 break;
             }
-            global_data.signum = 0;
+            glob.signum = 0;
         }
 
-        if (!global_data.daemonize)
+        if (!glob.daemonize)
             report();
     }
 
-    for (int i = 0; i < global_data.N; i++)
+    for (int i = 0; i < threads; i++)
         pthread_join(thread[i], NULL);
     
     report();
 
     now = time(0);
     printf("Stopped at %s", ctime(&now));
+
+    addr_list_cleanup(&glob.dstaddr);
+    addr_list_cleanup(&glob.locaddr);
+    addr_list_cleanup(&glob.srcaddr);
+    str_list_cleanup(&glob.netmap_dev);
 
     return 0;
 }
