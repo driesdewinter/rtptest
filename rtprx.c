@@ -14,21 +14,22 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
 #include <pthread.h>
 #include <sys/prctl.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <net/ethernet.h>
+#include <netinet/udp.h>
+#include <netinet/ip.h>
 
 #include "ns.h"
 #include "addr_list.h"
 #include "rtp_window.h"
 
 static void exit_with_usage() {
-    fprintf(stderr, "Usage: rtprx [--netmap <devs> [--rxonly]] [-d] [-i <us>] [-v] <locips> <dstips> <srcips> <dstport0> <#TSs>\n");
+    fprintf(stderr, "Usage: rtprx [--netmap <devs> [--rxonly] | --xdp <dev>] [-d] [-i <us>] [-v] <locips> <dstips> <srcips> <dstport0> <#TSs>\n");
     exit(0);
 }
 
@@ -45,7 +46,7 @@ struct global_data {
     ns_t interval;
     bool verbose;
     bool rxonly;
-    struct str_list netmap_dev;
+    struct str_list netdev;
 };
 struct global_data* globptr = NULL;
 
@@ -56,6 +57,11 @@ struct ts_data {
     uint32_t max_burst;
     bool running;
 } *tsptr0 = NULL;
+
+struct vlan_header {
+    uint16_t tag;
+    uint16_t ether_type;
+};
 
 static void sighandle(int signum)
 {
@@ -73,6 +79,46 @@ static void handle_udp_packet(struct ts_data* tsptr, const uint8_t* pkt) {
         fflush(stdout);
     }
     rtp_window_push(&tsptr->rtp_window, seqnr);
+}
+
+static bool handle_eth_packet(const uint8_t* pkt, size_t len) {
+    const uint8_t* pktend = pkt + len;
+    const struct ether_header* eth = (const struct ether_header*)pkt;
+    pkt += sizeof(struct ether_header);
+    if (pkt > pktend) return false;
+    uint16_t ether_type = ntohs(eth->ether_type);
+
+    if (ether_type == ETH_P_8021Q) {
+        const struct vlan_header* vlan = (const struct vlan_header*)pkt;
+        pkt += sizeof(struct vlan_header);
+        if (pkt > pktend) return false;
+        ether_type = ntohs(vlan->ether_type);
+    }
+
+    if (ether_type != ETH_P_IP) return false;
+
+    const struct iphdr* ip = (const struct iphdr*)pkt;
+    if (pkt + sizeof(struct iphdr) > pktend) return false;
+    pkt += ip->ihl * 4;
+    if (pkt > pktend) return false;
+
+    //printf("PKT %08x -> %08x\n", ntohl(ip->saddr), ntohl(ip->daddr));
+
+    if (ip->protocol != IPPROTO_UDP) return false;
+    if (ntohs(ip->frag_off) & 0x1fff) return false;
+
+    const struct udphdr* udp = (const struct udphdr*)pkt;
+    pkt += sizeof(struct udphdr);
+    if (pkt > pktend) return false;
+
+    uint16_t dstport = ntohs(udp->dest);
+    int tsindex = dstport - globptr->dstport0;
+    if (tsindex < 0 || tsindex >= globptr->N) return false;
+    struct ts_data* tsptr = &tsptr0[tsindex];
+
+    handle_udp_packet(tsptr, pkt);
+
+    return true;
 }
 
 static int join_mcast(int fd, struct sockaddr_in* dstaddr, struct sockaddr_in* locaddr, struct sockaddr_in* srcaddr)
@@ -209,28 +255,18 @@ leave:
     return NULL;
 }
 
-#define NETMAP
 #ifdef NETMAP
 
 #include <net/netmap.h>
 #include <net/netmap_user.h>
 
-#include <net/ethernet.h>
-#include <netinet/udp.h>
-#include <netinet/ip.h>
-
-struct vlan_header {
-    uint16_t tag;
-    uint16_t ether_type;
-};
-
 static void* run_netmap(void* arg)
 {
     struct ts_data* threadptr = (struct ts_data*)arg;
     int index = threadptr - tsptr0;
-    int step = globptr->netmap_dev.size;
+    int step = globptr->netdev.size;
 
-    const char* dev = str_list_get(&globptr->netmap_dev, index);
+    const char* dev = str_list_get(&globptr->netdev, index);
 
     char threadname[16];
     sprintf(threadname, "%s:%s", "rtprx", dev);
@@ -308,53 +344,9 @@ static void* run_netmap(void* arg)
                 burst++;
                 struct netmap_slot* rxslotp = &rxringp->slot[rxhead];
                 const uint8_t* pkt = (const uint8_t*)NETMAP_BUF(rxringp, rxslotp->buf_idx);
-                const uint8_t* pktend = pkt + rxslotp->len;
+                if (rxslotp->flags & NS_MOREFRAG) continue; // don't support this.
 
-                bool handled = false;
-                do {
-                    if (rxslotp->flags & NS_MOREFRAG) break; // don't support this.
-
-                    const struct ether_header* eth = (const struct ether_header*)pkt;
-                    pkt += sizeof(struct ether_header);
-                    if (pkt > pktend) break;
-                    uint16_t ether_type = ntohs(eth->ether_type);
-
-                    if (ether_type == ETH_P_8021Q) {
-                        const struct vlan_header* vlan = (const struct vlan_header*)pkt;
-                        pkt += sizeof(struct vlan_header);
-                        if (pkt > pktend) break;
-                        ether_type = ntohs(vlan->ether_type);
-                    }
-
-                    if (ether_type != ETH_P_IP) break;
-
-                    const struct iphdr* ip = (const struct iphdr*)pkt;
-                    if (pkt + sizeof(struct iphdr) > pktend) break;
-                    pkt += ip->ihl * 4;
-                    if (pkt > pktend) continue;
-
-                    //printf("PKT %08x -> %08x\n", ntohl(ip->saddr), ntohl(ip->daddr));
-
-                    if (ip->protocol != IPPROTO_UDP) break;
-                    if (ntohs(ip->frag_off) & 0x1fff) break;
-
-                    const struct udphdr* udp = (const struct udphdr*)pkt;
-                    pkt += sizeof(struct udphdr);
-                    if (pkt > pktend) break;
-
-                    uint16_t dstport = ntohs(udp->dest);
-                    int tsindex = dstport - globptr->dstport0;
-                    if (tsindex < 0 || tsindex >= globptr->N) break;
-                    if (tsindex % step != index) break;
-                    struct ts_data* tsptr = &tsptr0[tsindex];
-
-                    handled = true;
-
-                    if (!first) handle_udp_packet(tsptr, pkt);
-
-                } while (false);
-
-                if (handled) continue;
+                if (handle_eth_packet(pkt, rxslotp->len)) continue;
 
                 if (txhead == txtail) continue; // this is packet drop
 
@@ -430,8 +422,222 @@ leave:
 
 static void* run_netmap(void* arg)
 {
-  struct thread_data *threadptr = arg;
-  fprintf(stderr, "Netmap support was disabled at compile time. Exiting...\n");
+    struct ts_data *threadptr = arg;
+    fprintf(stderr, "Netmap support was disabled at compile time. Exiting...\n");
+    threadptr->running = false;
+    return NULL;
+}
+
+#endif
+
+#ifdef XDP
+
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+#include <bpf/xsk.h>
+#include "bpfprog.h"
+
+static void* run_xdp(void* arg)
+{
+    struct ts_data *threadptr = arg;
+    const char* dev = str_list_get(&globptr->netdev, 0);
+    int igmpfd = - 1;
+    int progfd = -1;
+    int globalparamsfd = -1;
+    int xskmapfd = -1;
+    int nrqueues = get_nrqueues(dev);
+    struct bpf_object *obj = NULL;
+    int err = 0;
+
+    char threadname[16];
+    sprintf(threadname, "%s:%s", "rtprx", dev);
+    prctl(PR_SET_NAME, threadname, 0, 0, 0);
+
+    struct xsk_info
+    {
+      struct xsk_umem* umem;
+      struct xsk_socket* xsk;
+      struct xsk_ring_prod fillq;
+      struct xsk_ring_cons compq;
+      struct xsk_ring_cons rxq;
+      void *mem;
+    };
+    struct xsk_info xsk_info[nrqueues];
+    memset(xsk_info, 0, sizeof(xsk_info));
+
+    int ifindex = if_nametoindex(dev);
+    if (!ifindex)
+    {
+        fprintf(stderr, "if_nametoindex(%s) failed: %m\n", dev);
+        goto leave;
+    }
+
+    /* Use libbpf for extracting BPF byte-code from BPF-ELF object, and
+     * loading this into the kernel via bpf-syscall */
+    err = bpf_prog_load("bpfprog.o", BPF_PROG_TYPE_XDP, &obj, &progfd);
+    if (err) {
+        fprintf(stderr, "bpf_prog_load(\"bpfprog.o\", BPF_PROG_TYPE_XDP) failed: %s\n", strerror(-err));
+        goto leave;
+    }
+
+    struct bpf_map *map = bpf_object__find_map_by_name(obj, "global_params_map");
+    if (!map) {
+        fprintf(stderr, "bpf_object__find_map_by_name(global_params_map) failed: %m\n");
+        goto leave;
+    }
+    globalparamsfd = bpf_map__fd(map);
+    map = bpf_object__find_map_by_name(obj, "xsk_map");
+    if (!map) {
+        fprintf(stderr, "bpf_object__find_map_by_name(xsk_map) failed: %m\n");
+        goto leave;
+    }
+    xskmapfd = bpf_map__fd(map);
+
+    uint32_t mapkey = 0;
+    struct global_params mapval = {
+            .udp_lo  = globptr->dstport0,
+            .udp_hi = globptr->dstport0 + globptr->N - 1
+    };
+    err = bpf_map_update_elem(globalparamsfd, &mapkey, &mapval, 0);
+    if (err)
+    {
+        fprintf(stderr, "bpf_map_update_elem() failed: %s\n", strerror(-err));
+        goto leave;
+    }
+
+    err = bpf_set_link_xdp_fd(ifindex, progfd, 0);
+    if (err)
+    {
+        fprintf(stderr, "bpf_set_link_xdp_fd(%s) failed: %s\n", dev, strerror(-err));
+        goto leave;
+    }
+
+    struct xsk_umem_config umem_config = {
+         .fill_size = 8192,
+         .comp_size = 8192,
+         .frame_size = 2048,
+         .frame_headroom = 0,
+         .flags = 0
+    };
+    struct xsk_socket_config xsk_config = {
+         .rx_size = 8192,
+         .tx_size = 0,
+         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+         .xdp_flags = 0,
+         .bind_flags = 0
+    };
+
+    for (int queueid = 0; queueid < nrqueues; queueid++)
+    {
+        struct xsk_info* xsk = &xsk_info[queueid];
+        size_t umem_size = umem_config.fill_size * umem_config.frame_size;
+        posix_memalign(&xsk->mem, getpagesize(), umem_size);
+        err = xsk_umem__create(&xsk->umem, xsk->mem, umem_size, &xsk->fillq, &xsk->compq, &umem_config);
+        if (err)
+        {
+            fprintf(stderr, "xsk_umem__create() failed: %s\n", strerror(-err));
+            goto leave;
+        }
+
+        err = xsk_socket__create(&xsk->xsk, dev, queueid, xsk->umem, &xsk->rxq, NULL, &xsk_config);
+        if (err)
+        {
+            fprintf(stderr, "xsk_socket__create() failed: %s\n", strerror(-err));
+            goto leave;
+        }
+
+        int xskfd = xsk_socket__fd(xsk->xsk);
+        err = bpf_map_update_elem(xskmapfd, &queueid, &xskfd, 0);
+        if (err)
+        {
+            fprintf(stderr, "bpf_map_update_elem(xsk_map, queue_id=%d, fd=%d) failed: %s\n", queueid, xskfd, strerror(-err));
+            goto leave;
+        }
+
+        /* Stuff the receive path with buffers, we assume we have enough */
+        __u32 idx = 0;
+        xsk_ring_prod__reserve(&xsk->fillq, umem_config.fill_size, &idx);
+        for (__u32 i = 0; i < umem_config.fill_size; i++)
+        {
+            *xsk_ring_prod__fill_addr(&xsk->fillq, idx++) = umem_config.frame_size * i;
+        }
+        xsk_ring_prod__submit(&xsk->fillq, umem_config.fill_size);
+    }
+
+    igmpfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (igmpfd < 0) {
+        fprintf(stderr, "socket() failed: %m\n");
+        goto leave;
+    }
+    int memberships = globptr->dstaddr.size;
+    if (memberships < globptr->srcaddr.size)
+        memberships = globptr->srcaddr.size;
+    for (int i = 0; i < memberships; i++)
+    {
+        struct sockaddr_in dstaddr = *addr_list_get(&globptr->dstaddr, i);
+        uint8_t *dstip = (uint8_t *)&dstaddr.sin_addr;
+        if ((dstip[0] & 0xf0) == 0xe0) {
+            if (join_mcast(igmpfd, &dstaddr, addr_list_get(&globptr->locaddr, i),
+                                             addr_list_get(&globptr->srcaddr, i)) < 0)
+                goto leave;
+        }
+    }
+
+    ns_t t = ns_now();
+
+    for (;!globptr->killed;) {
+
+        for (int queueid = 0; queueid < nrqueues; queueid++)
+        {
+            struct xsk_info* xsk = &xsk_info[queueid];
+            __u32 rxidx = 0, fillidx = 0;
+            size_t n = xsk_ring_cons__peek(&xsk->rxq, umem_config.fill_size, &rxidx);
+            //if (n) fprintf(stderr, "queueid=%d xsk_ring_cons__peek=%zu\n", queueid, n);
+            if (n) xsk_ring_prod__reserve(&xsk->fillq, n, &fillidx);
+            for (__u32 i = 0; i < n; i++)
+            {
+                const struct xdp_desc* desc = xsk_ring_cons__rx_desc(&xsk->rxq, rxidx++);
+                const uint8_t *pkt = xsk_umem__get_data(xsk->mem, desc->addr);
+                handle_eth_packet(pkt, desc->len);
+                *xsk_ring_prod__fill_addr(&xsk->fillq, fillidx++) = desc->addr;
+            }
+            if (n) xsk_ring_cons__release(&xsk->rxq, n);
+            if (n) xsk_ring_prod__submit(&xsk->fillq, n);
+        }
+
+        ns_t t1 = ns_now();
+
+        t += globptr->interval;
+
+        if (t >= t1 + 1000) {
+            struct timeval tv;
+            ns_totimeval(t - t1, &tv);
+            select(0, NULL, NULL, NULL, &tv);
+        }
+
+    }
+
+leave:
+    if (igmpfd > 0)
+        close(igmpfd);
+    for (int i = 0; i < nrqueues; i++)
+    {
+      struct xsk_info* xsk = &xsk_info[i];
+      xsk_socket__delete(xsk->xsk);
+      xsk_umem__delete(xsk->umem);
+      free(xsk->mem);
+    }
+    if (ifindex) bpf_set_link_xdp_fd(ifindex, -1, 0); // detach XDP program from network device.
+    bpf_object__close(obj);
+    threadptr->running = false;
+    return NULL;
+}
+#else
+
+static void* run_xdp(void* arg)
+{
+  struct ts_data *threadptr = arg;
+  fprintf(stderr, "XDP support was disabled at compile time. Exiting...\n");
   threadptr->running = false;
   return NULL;
 }
@@ -498,7 +704,7 @@ static void report()
 
 int main(int argc, char **argv) {
     struct global_data glob = { .interval = 10000000ULL };
-    bool netmap = false;
+    bool netmap = false, xdp = false;
     globptr = &glob;
 
     while (argc > 6) {
@@ -510,8 +716,13 @@ int main(int argc, char **argv) {
             glob.interval = 1000ULL * atoi(argv[2]);
             argv++; argc--;
         } else if (!strcmp(argv[1], "--netmap")) {
-            str_list_parse(&glob.netmap_dev, argv[2]);
+            str_list_parse(&glob.netdev, argv[2]);
             netmap = true;
+            argv++; argc--;
+        } else if (!strcmp(argv[1], "--xdp")) {
+            str_list_parse(&glob.netdev, argv[2]);
+            if (glob.netdev.size != 1) exit_with_usage();
+            xdp = true;
             argv++; argc--;
         } else if (!strcmp(argv[1], "--rxonly")) {
             glob.rxonly = true;
@@ -564,12 +775,21 @@ int main(int argc, char **argv) {
        daemon(1, 1);
 
     int threads = glob.N;
-    if (netmap && threads > glob.netmap_dev.size) threads = glob.netmap_dev.size;
+    if ((netmap || xdp) && threads > glob.netdev.size) threads = glob.netdev.size;
     pthread_t thread[threads];
     if (netmap) {
-        for (int i = 0; i < glob.netmap_dev.size; i++) {
+        for (int i = 0; i < glob.netdev.size; i++) {
             ts[i].running = true;
             int err = pthread_create(&thread[i], NULL, run_netmap, &ts[i]);
+            if (err) {
+                fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
+                exit(1);
+            }
+        }
+    } else if (xdp) {
+        for (int i = 0; i < glob.netdev.size; i++) {
+            ts[i].running = true;
+            int err = pthread_create(&thread[i], NULL, run_xdp, &ts[i]);
             if (err) {
                 fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
                 exit(1);
@@ -633,7 +853,7 @@ int main(int argc, char **argv) {
     addr_list_cleanup(&glob.dstaddr);
     addr_list_cleanup(&glob.locaddr);
     addr_list_cleanup(&glob.srcaddr);
-    str_list_cleanup(&glob.netmap_dev);
+    str_list_cleanup(&glob.netdev);
 
     return 0;
 }

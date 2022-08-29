@@ -72,5 +72,45 @@ static inline void rtp_window_push(struct rtp_window* window, uint16_t seqnr) {
 	}
 }
 
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
+
+static inline int get_nrqueues(const char* dev)
+{
+        struct ethtool_channels channels = { .cmd = ETHTOOL_GCHANNELS };
+        struct ifreq ifr = {};
+        int fd, err, ret;
+
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0)
+                return -errno;
+
+        ifr.ifr_data = (void *)&channels;
+        memcpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
+        ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+        err = ioctl(fd, SIOCETHTOOL, &ifr);
+
+        if (err)
+            fprintf(stderr, "ioctl(SIOCETHTOOL, {dev=%s cmd=ETHTOOL_GCHANNELS}) failed: %m\n", dev);
+
+        if (err || channels.combined_count == 0)
+                /* If the device says it has no channels, then all traffic
+                 * is sent to a single stream, so max queues = 1.
+                 */
+                ret = 1;
+        else
+                ret = channels.combined_count;
+
+        close(fd);
+        return ret;
+}
+
+
 #endif
 
