@@ -89,7 +89,7 @@ int handle_packet(struct xdp_md *ctx)
     const struct vlanhdr* vlan = (const struct vlanhdr*)cur;
     if (end < cur + sizeof(struct vlanhdr)) return XDP_PASS; // too short to hold vlan header
     cur += sizeof(struct vlanhdr);
-    eth_proto = __be16_to_cpu(vlan->tag) & 0x0FFF;
+    eth_proto = __be16_to_cpu(vlan->type);
   }
 
   __u8 ip_proto = IPPROTO_NONE;

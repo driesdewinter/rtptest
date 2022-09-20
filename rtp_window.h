@@ -84,7 +84,7 @@ static inline void rtp_window_push(struct rtp_window* window, uint16_t seqnr) {
 static inline int get_nrqueues(const char* dev)
 {
         struct ethtool_channels channels = { .cmd = ETHTOOL_GCHANNELS };
-        struct ifreq ifr = {};
+        struct ifreq ifr;
         int fd, err, ret;
 
         fd = socket(AF_INET, SOCK_DGRAM, 0);

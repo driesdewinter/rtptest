@@ -31,7 +31,7 @@
 #include "rtp_window.h"
 
 static void exit_with_usage() {
-    fprintf(stderr, "Usage: rtptx [--netmap <devs> [--txonly] | --xdp <dev>]  [--dmac <dmacs>] [-d] [--sndbuf] [-i <us>] [-v] <locips> <dstips> <dstport0> <#TSs> <TS bitrate (Mbps)>\n");
+    fprintf(stderr, "Usage: rtptx [--netmap <dev> [--txonly] | --xdp <dev>]  [--dmac <dmacs>] [--vlan <vlan>] [-d] [--sndbuf] [-i <us>] [-v] <locips> <dstips> <dstport0> <#TSs> <TS bitrate (Mbps)>\n");
     exit(0);
 }
 
@@ -52,14 +52,18 @@ struct global_data {
     bool txonly;
     bool verbose;
     int nrqueues;
+    uint16_t vlanid;
+#ifdef NETMAP
+    int fd;
+    void *mem;
+    size_t memsize;
+    struct netmap_if *ifp;
+#endif
 } *globptr = NULL;
 
-struct packet {
-    uint8_t eth[14];
-    uint8_t ip[20];
-    uint8_t udp[8];
-    uint8_t rtp[12];
-    uint8_t mpeg[7 * 188];
+struct vlan_header {
+    uint16_t tag;
+    uint16_t ether_type;
 };
 
 struct ts_data {
@@ -72,7 +76,8 @@ struct ts_data {
     uint32_t prev_intervalcounter;
     bool running;
     ns_t max_drift;
-    struct packet pkt;
+    uint8_t packet[sizeof(struct ether_header) + sizeof(struct vlan_header) + sizeof(struct iphdr) + sizeof(struct udphdr) + 12/*RTP*/ + 7 * 188/*MPEG*/];
+    size_t packetlen;
     uint16_t seqnr;
     uint32_t bytebucket;
 } *tsptr0 = NULL;
@@ -81,12 +86,28 @@ static void sighandle(int signum) {
   globptr->signum = signum;
 }
 
-static void init_packet(struct packet* pkt, const char* dev, int tsindex)
+static size_t init_packet(uint8_t* pkt, const char* dev, int tsindex)
 {
-    struct ts_data* tsptr = &tsptr0[tsindex];
-    struct ether_header* eth = (struct ether_header*)pkt->eth;
-    struct iphdr* ip = (struct iphdr*)pkt->ip;
-    struct udphdr* udp = (struct udphdr*)pkt->udp;
+    uint8_t* pkt0 = pkt;
+    struct ether_header* eth = (struct ether_header*)pkt;
+    pkt += sizeof(struct ether_header);
+
+    if (globptr->vlanid != 0)
+    {
+        struct vlan_header* vlan = (struct vlan_header*)pkt;
+        pkt += sizeof(struct vlan_header);
+        eth->ether_type = htons(ETH_P_8021Q);
+        vlan->ether_type = htons(ETH_P_IP);
+        vlan->tag = htons(globptr->vlanid);
+    }
+    else
+    {
+        eth->ether_type = htons(ETH_P_IP);
+    }
+
+    struct iphdr* ip = (struct iphdr*)pkt;
+    pkt += sizeof(struct iphdr);
+
     struct ifaddrs *ifaphead, *ifap;
     if (dev && getifaddrs(&ifaphead) == 0) {
         for (ifap = ifaphead; ifap; ifap = ifap->ifa_next) {
@@ -118,8 +139,6 @@ static void init_packet(struct packet* pkt, const char* dev, int tsindex)
         eth->ether_dhost[5] = dstip[3];
     }
 
-    eth->ether_type = htons(ETH_P_IP);
-
     ip->version = 4;
     ip->ihl = 5;
     ip->check = 0;
@@ -135,28 +154,38 @@ static void init_packet(struct packet* pkt, const char* dev, int tsindex)
     ip->daddr = addr_list_get(&globptr->dstaddr, tsindex)->sin_addr.s_addr;
     // and finally the checksum
     uint32_t ipcsum = 0;
-    for (const uint16_t* p = (const uint16_t*)tsptr->pkt.ip; p < (const uint16_t*)tsptr->pkt.udp; p++) {
+    for (const uint16_t* p = (const uint16_t*)ip; p < (const uint16_t*)(ip + 1); p++) {
         ipcsum += ntohs(*p);
     }
     ip->check = htons(~(ipcsum + (ipcsum >> 16)));
+
+    struct udphdr* udp = (struct udphdr*)pkt;
+    pkt += sizeof(struct udphdr);
 
     udp->check = htons(0);
     udp->len = htons(sizeof(struct udphdr) + 12 + 7 * 188);
     udp->source = htons(49152);
     udp->dest = htons(globptr->dstport0 + tsindex);
-    memset(tsptr->pkt.rtp, 0xff, 12);
-    memset(tsptr->pkt.mpeg, 0xff, 7 * 188);
-    tsptr->pkt.rtp[0] = 0x80;
-    tsptr->pkt.rtp[1] = 0x21;
+    uint8_t* rtp = pkt;
+    pkt += 12;
+    memset(rtp, 0xff, 12);
+    rtp[0] = 0x80;
+    rtp[1] = 0x21;
+
+    uint8_t* mpeg = pkt;
+    pkt += 7 * 188;
+
+    memset(mpeg, 0xff, 7 * 188);
     int i;
     for (i = 0; i < 7; i++) {
-        tsptr->pkt.mpeg[i * 188 + 0] = 0x47;
-        tsptr->pkt.mpeg[i * 188 + 1] = 0x1f;
-        tsptr->pkt.mpeg[i * 188 + 2] = 0xff;
-        tsptr->pkt.mpeg[i * 188 + 3] = 0x00;
+        mpeg[i * 188 + 0] = 0x47;
+        mpeg[i * 188 + 1] = 0x1f;
+        mpeg[i * 188 + 2] = 0xff;
+        mpeg[i * 188 + 3] = 0x00;
     }
-}
 
+    return pkt - pkt0;
+}
 
 static void *run(void *arg) {
     struct ts_data *tsptr = arg;
@@ -200,12 +229,13 @@ static void *run(void *arg) {
         }
     }
     
-    init_packet(&tsptr->pkt, NULL, index);
+    tsptr->packetlen = init_packet(tsptr->packet, NULL, index);
     struct iovec iov;
     struct msghdr msg;
     struct sockaddr_in addr = *dstaddr;
     addr.sin_port = htons(dstport);
-    iov.iov_base = tsptr->pkt.rtp;
+    uint8_t* rtp = &tsptr->packet[tsptr->packetlen - 12 - 7 * 188];
+    iov.iov_base = rtp;
     iov.iov_len = 12 + 7 * 188;
     msg.msg_name = &addr;
     msg.msg_namelen = sizeof(addr);
@@ -225,9 +255,9 @@ static void *run(void *arg) {
         for (tsptr->bytebucket += globptr->bpi;
                 tsptr->bytebucket >= 7 * 188;
                 tsptr->bytebucket -= 7 * 188) {
-                
-            tsptr->pkt.rtp[2] = tsptr->seqnr >> 8;
-            tsptr->pkt.rtp[3] = tsptr->seqnr & 0xff;
+
+            rtp[2] = tsptr->seqnr >> 8;
+            rtp[3] = tsptr->seqnr & 0xff;
             tsptr->seqnr++;
             
             if (sendmsg(s, &msg, 0) <= 0) {
@@ -266,16 +296,9 @@ leave:
 #include <net/netmap.h>
 #include <net/netmap_user.h>
 
-static void* run_netmap(void* arg) {
-    struct ts_data* threadptr = (struct ts_data*)arg;
-    int index = threadptr - tsptr0;
-    int step = globptr->netdev.size;
-
-    const char* dev = str_list_get(&globptr->netdev, index);
-
-    char threadname[16];
-    sprintf(threadname, "%s:%s", "rtptx", dev);
-    prctl(PR_SET_NAME, threadname, 0, 0, 0);
+static int init_netmap()
+{
+    const char* dev = str_list_get(&globptr->netdev, 0);
 
     struct nmreq_register reg = {
         .nr_mode = NR_REG_NIC_SW,
@@ -285,49 +308,66 @@ static void* run_netmap(void* arg) {
         .nr_reqtype = NETMAP_REQ_REGISTER,
         .nr_body    = (uint64_t)&reg,
     };
-    void *mem = MAP_FAILED;
-    int fd = -1;
 
-    fd = open("/dev/netmap", O_RDWR);
-    if (fd < 0) {
+    globptr->fd = open("/dev/netmap", O_RDWR);
+    if (globptr->fd < 0) {
         fprintf(stderr, "open(/dev/netmap) failed: %m\n");
-        goto leave;
+        return -1;
     }
 
     snprintf(hdr.nr_name, NETMAP_REQ_IFNAMSIZ, "%s", dev);
-    if (ioctl(fd, NIOCCTRL, &hdr) < 0) {
+    if (ioctl(globptr->fd, NIOCCTRL, &hdr) < 0) {
         fprintf(stderr, "ioctl(/dev/netmap, NIOCCTRL, {type=NETMAP_REQ_REGISTER, port=%s}) failed: %m\n", dev);
-        goto leave;
+        return -1;
     }
 
-    mem = mmap(NULL, reg.nr_memsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mem == MAP_FAILED) {
+    globptr->memsize = reg.nr_memsize;
+    globptr->mem = mmap(NULL, globptr->memsize, PROT_READ | PROT_WRITE, MAP_SHARED, globptr->fd, 0);
+    if (globptr->mem == MAP_FAILED) {
+        globptr->mem = NULL;
         fprintf(stderr, "mmap(/dev/netmap) failed: %m\n");
-        goto leave;
+        return -1;
     }
-    struct netmap_if *ifp = NETMAP_IF(mem, reg.nr_offset);
+    globptr->ifp = NETMAP_IF(globptr->mem, reg.nr_offset);
 
-    for (int tsindex = index; tsindex < globptr->N; tsindex += step)
+    for (int tsindex = 0; tsindex < globptr->N; tsindex++)
     {
         struct ts_data* tsptr = &tsptr0[tsindex];
-        init_packet(&tsptr->pkt, dev);
+        tsptr->packetlen = init_packet(tsptr->packet, dev, tsindex);
     }
+    return 0;
+}
 
+static void* run_netmap(void* arg)
+{
+    struct ts_data *threadptr = arg;
+    uint32_t index = threadptr - tsptr0;
+    int step = globptr->nrqueues;
+    const char* dev = str_list_get(&globptr->netdev, 0);
+
+    char threadname[16];
+    sprintf(threadname, "%s:%s:%u", "rtptx", dev, index);
+    prctl(PR_SET_NAME, threadname, 0, 0, 0);
     ns_t t = ns_now();
+
+    uint32_t Ntx = globptr->ifp->ni_tx_rings;
+    uint32_t Nhosttx = globptr->ifp->ni_host_tx_rings;
+    uint32_t Nrx = globptr->ifp->ni_rx_rings;
+    uint32_t Nhostrx = globptr->ifp->ni_host_rx_rings;
 
     for (;!globptr->killed;) {
 
         ns_t t0 = ns_now();
 
-        if (ioctl(fd, NIOCRXSYNC, NULL) < 0) {
-            fprintf(stderr, "ioctl(/dev/netmap, NIOCRXSYNC) failed: %m\n");
-            goto leave;
-        }
-
         // From host rx ring to nic tx ring
-        for (uint32_t rxringi = 0; rxringi < ifp->ni_host_rx_rings; rxringi++) {
-            struct netmap_ring* rxringp = NETMAP_RXRING(ifp, ifp->ni_rx_rings + rxringi);
-            struct netmap_ring* txringp = NETMAP_TXRING(ifp, rxringi % ifp->ni_tx_rings);
+        for (uint32_t rxringi = index; rxringi < Nhostrx; rxringi += globptr->nrqueues) {
+            uint32_t qindex = Ntx + Nhosttx + Nrx + rxringi;
+            if (ioctl(globptr->fd, NIOCQSYNC, &qindex) < 0) {
+                fprintf(stderr, "ioctl(/dev/netmap, NIOCQSYNC, %u) failed: %m\n", qindex);
+                goto leave;
+            }
+            struct netmap_ring* rxringp = NETMAP_RXRING(globptr->ifp, Nrx + rxringi);
+            struct netmap_ring* txringp = NETMAP_TXRING(globptr->ifp, rxringi % Ntx);
             uint32_t rxhead = rxringp->head, rxtail = rxringp->tail;
             uint32_t txhead = txringp->head, txtail = txringp->tail;
 
@@ -350,17 +390,19 @@ static void* run_netmap(void* arg) {
 
         for (int tsindex = index; tsindex < globptr->N; tsindex += step)
         {
-            struct netmap_ring* txringp = NETMAP_TXRING(ifp, tsindex/step % ifp->ni_tx_rings);
+            struct netmap_ring* txringp = NETMAP_TXRING(globptr->ifp, index);
             struct ts_data* tsptr = &tsptr0[tsindex];
             uint32_t txhead = txringp->head, txtail = txringp->tail;
+
+            uint8_t* rtp = &tsptr->packet[tsptr->packetlen - 12 - 7 * 188];
 
             uint32_t sent = 0, dropped = 0;
             for (tsptr->bytebucket += globptr->bpi;
                     tsptr->bytebucket >= 7 * 188;
                     tsptr->bytebucket -= 7 * 188) {
 
-                tsptr->pkt.rtp[2] = tsptr->seqnr >> 8;
-                tsptr->pkt.rtp[3] = tsptr->seqnr & 0xff;
+                rtp[2] = tsptr->seqnr >> 8;
+                rtp[3] = tsptr->seqnr & 0xff;
                 tsptr->seqnr++;
 
                 if (txhead == txtail)
@@ -371,8 +413,8 @@ static void* run_netmap(void* arg) {
 
                 struct netmap_slot* txslotp = &txringp->slot[txhead];
                 uint8_t* pkt = (uint8_t*)NETMAP_BUF(txringp, txslotp->buf_idx);
-                memcpy(pkt, &tsptr->pkt, sizeof(struct packet));
-                txslotp->len = sizeof(struct packet);
+                memcpy(pkt, &tsptr->packet[0], tsptr->packetlen);
+                txslotp->len = tsptr->packetlen;
                 txhead = nm_ring_next(txringp, txhead);
                 sent++;
             }
@@ -390,36 +432,47 @@ static void* run_netmap(void* arg) {
             }
         }
 
-        // from nic rx ring to rtp window or to host rx ring
-        if (!globptr->txonly)
-        {
-          for (uint32_t rxringi = 0; rxringi < ifp->ni_rx_rings; rxringi++) {
-              struct netmap_ring* rxringp = NETMAP_RXRING(ifp, rxringi);
-              struct netmap_ring* txringp = NETMAP_TXRING(ifp, ifp->ni_tx_rings + rxringi % ifp->ni_host_tx_rings);
-              uint32_t rxhead = rxringp->head, rxtail = rxringp->tail;
-              uint32_t txhead = txringp->head, txtail = txringp->tail;
-
-              for (; rxhead != rxtail; rxhead = nm_ring_next(rxringp, rxhead)) {
-                  struct netmap_slot* rxslotp = &rxringp->slot[rxhead];
-
-                  if (txhead == txtail) continue; // this is packet drop
-
-                  struct netmap_slot* txslotp = &txringp->slot[txhead];
-                  struct netmap_slot tmp = *txslotp;
-                  *txslotp = *rxslotp;
-                  *rxslotp = tmp;
-                  txslotp->flags |= NS_BUF_CHANGED;
-                  rxslotp->flags |= NS_BUF_CHANGED;
-                  txhead = nm_ring_next(txringp, txhead);
-              }
-              rxringp->head = rxringp->cur = rxhead;
-              txringp->head = txringp->cur = txhead;
-          }
+        if (ioctl(globptr->fd, NIOCQSYNC, &index) < 0) {
+            fprintf(stderr, "ioctl(/dev/netmap, NIOCQSYNC, %u) failed: %m\n", index);
+            goto leave;
         }
 
-        if (ioctl(fd, NIOCTXSYNC, NULL) < 0) {
-            fprintf(stderr, "ioctl(/dev/netmap, NIOCTXSYNC) failed: %m\n");
-            goto leave;
+        // from nic rx ring to rtp window or to host tx ring
+        if (!globptr->txonly && index < Nhosttx)
+        {
+            for (uint32_t rxringi = 0; rxringi < Nrx; rxringi++) {
+                uint32_t qindex = Ntx + Nhosttx + rxringi;
+                if (ioctl(globptr->fd, NIOCQSYNC, &qindex) < 0) {
+                    fprintf(stderr, "ioctl(/dev/netmap, NIOCQSYNC, %u) failed: %m\n", qindex);
+                    goto leave;
+                }
+                struct netmap_ring* rxringp = NETMAP_RXRING(globptr->ifp, rxringi);
+                struct netmap_ring* txringp = NETMAP_TXRING(globptr->ifp, Ntx + rxringi % Nhosttx);
+                uint32_t rxhead = rxringp->head, rxtail = rxringp->tail;
+                uint32_t txhead = txringp->head, txtail = txringp->tail;
+
+                for (; rxhead != rxtail; rxhead = nm_ring_next(rxringp, rxhead)) {
+                    struct netmap_slot* rxslotp = &rxringp->slot[rxhead];
+
+                    if (txhead == txtail) continue; // this is packet drop
+
+                    struct netmap_slot* txslotp = &txringp->slot[txhead];
+                    struct netmap_slot tmp = *txslotp;
+                    *txslotp = *rxslotp;
+                    *rxslotp = tmp;
+                    txslotp->flags |= NS_BUF_CHANGED;
+                    rxslotp->flags |= NS_BUF_CHANGED;
+                    txhead = nm_ring_next(txringp, txhead);
+                }
+                rxringp->head = rxringp->cur = rxhead;
+                txringp->head = txringp->cur = txhead;
+            }
+
+            uint32_t qindex = Ntx + index;
+            if (ioctl(globptr->fd, NIOCQSYNC, &qindex) < 0) {
+                fprintf(stderr, "ioctl(/dev/netmap, NIOCQSYNC, %u) failed: %m\n", qindex);
+                goto leave;
+            }
         }
 
         ns_t t1 = ns_now();
@@ -439,25 +492,28 @@ static void* run_netmap(void* arg) {
             threadptr->max_drift = t1 - t;
         }
     }
-
 leave:
-    if (mem != MAP_FAILED)
-        munmap(mem, reg.nr_memsize);
-    if (fd > 0)
-        close(fd);
     threadptr->running = false;
     return NULL;
 }
 
+static void cleanup_netmap()
+{
+    if (globptr->mem != MAP_FAILED)
+        munmap(globptr->mem, globptr->memsize);
+    if (globptr->fd > 0)
+        close(globptr->fd);
+}
+
 #else
 
-static void* run_netmap(void* arg)
+static int init_netmap()
 {
-  struct ts_data *tsptr = arg;
   fprintf(stderr, "Netmap support was disabled at compile time. Exiting...\n");
-  tsptr->running = false;
-  return NULL;
+  return -1;
 }
+static void* run_netmap(void* arg) { (void)arg; return NULL; }
+static void cleanup_netmap() {}
 
 #endif
 
@@ -534,7 +590,7 @@ static void* run_xdp(void* arg)
     for (int tsindex = index; tsindex < globptr->N; tsindex += step)
     {
         struct ts_data* tsptr = &tsptr0[tsindex];
-        init_packet(&tsptr->pkt, dev, tsindex);
+        tsptr->packetlen = init_packet(&tsptr->packet[0], dev, tsindex);
     }
 
     ns_t t = ns_now();
@@ -546,14 +602,15 @@ static void* run_xdp(void* arg)
         for (int tsindex = index; tsindex < globptr->N; tsindex += step)
         {
             struct ts_data* tsptr = &tsptr0[tsindex];
+            uint8_t* rtp = &tsptr->packet[tsptr->packetlen - 12 - 7 * 188];
 
             uint32_t sent = 0, dropped1 = 0, dropped2 = 0;
             for (tsptr->bytebucket += globptr->bpi;
                     tsptr->bytebucket >= 7 * 188;
                     tsptr->bytebucket -= 7 * 188) {
 
-                tsptr->pkt.rtp[2] = tsptr->seqnr >> 8;
-                tsptr->pkt.rtp[3] = tsptr->seqnr & 0xff;
+                rtp[2] = tsptr->seqnr >> 8;
+                rtp[3] = tsptr->seqnr & 0xff;
                 tsptr->seqnr++;
 
                 if (!frame_stack_ptr)
@@ -572,9 +629,9 @@ static void* run_xdp(void* arg)
 
                 struct xdp_desc* desc = xsk_ring_prod__tx_desc(&xsk->txq, txidx);
                 desc->addr = frame_stack[--frame_stack_ptr];
-                desc->len = sizeof(struct packet);
+                desc->len = tsptr->packetlen;
                 uint8_t *pkt = xsk_umem__get_data(xsk->mem, desc->addr);
-                memcpy(pkt, &tsptr->pkt, sizeof(struct packet));
+                memcpy(pkt, &tsptr->packet[0], tsptr->packetlen);
                 sent++;
                 xsk_ring_prod__submit(&xsk->txq, 1);
             }
@@ -582,7 +639,7 @@ static void* run_xdp(void* arg)
             tsptr->sent += sent;
             tsptr->dropped += dropped1 + dropped2;
 
-            if (globptr->verbose && (dropped1 || dropped2 || sent)) {
+            if (globptr->verbose && (dropped1 || dropped2)) {
                 time_t now = time(0);
                 char nowstr[26];
                 printf("Sent %u and dropped %u + %u packets on port %d at %s",
@@ -591,7 +648,9 @@ static void* run_xdp(void* arg)
             }
         }
 
-        for (err = EAGAIN; err == EAGAIN; err = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0));
+        err = EAGAIN;
+        while (err == EAGAIN)
+            err = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 
         { // collect frame pointers of completed transmissions
             __u32 compidx = 0;
@@ -713,16 +772,19 @@ int main(int argc, char **argv) {
             argv++; argc--;
         } else if (!strcmp(argv[1], "--netmap")) {
             str_list_parse(&glob.netdev, argv[2]);
+            if (glob.netdev.size != 1) exit_with_usage();
             netmap = true;
             argv++; argc--;
         } else if (!strcmp(argv[1], "--xdp")) {
             str_list_parse(&glob.netdev, argv[2]);
             if (glob.netdev.size != 1) exit_with_usage();
             xdp = true;
-            glob.nrqueues = get_nrqueues(glob.netdev.data[0]);
             argv++; argc--;
         } else if (!strcmp(argv[1], "--dmac")) {
             ether_addr_list_parse(&glob.dmac, argv[2]);
+            argv++; argc--;
+        } else if (!strcmp(argv[1], "--vlan")) {
+            glob.vlanid = atoi(argv[2]);
             argv++; argc--;
         } else if (!strcmp(argv[1], "--txonly")) {
             glob.txonly = true;
@@ -768,8 +830,17 @@ int main(int argc, char **argv) {
     time_t now = time(0);
     printf("Kicked off at %s", ctime(&now));
     fflush(stdout);
-    
-    struct ts_data ts[glob.N];
+
+    int tsdatasize = glob.N;
+    int threads = glob.N;
+    if (netmap || xdp)
+    {
+      glob.nrqueues = get_nrqueues(glob.netdev.data[0]);
+      threads = glob.nrqueues;
+      if (threads > tsdatasize) tsdatasize = threads;
+    }
+
+    struct ts_data ts[tsdatasize];
     memset(ts, 0, sizeof(ts));
     tsptr0 = ts;
 
@@ -778,36 +849,22 @@ int main(int argc, char **argv) {
     else
        report();
 
-    int threads = glob.N;
-    if (netmap && threads > glob.netdev.size) threads = glob.netdev.size;
-    if (xdp && threads > glob.nrqueues) threads = glob.nrqueues;
-    pthread_t thread[threads];
     if (netmap) {
-        for (int i = 0; i < threads; i++) {
-            ts[i].running = true;
-            int err = pthread_create(&thread[i], NULL, run_netmap, &ts[i]);
-            if (err) {
-                fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
-                exit(1);
-            }
-        }
-    } else if (xdp) {
-        for (int i = 0; i < threads; i++) {
-            ts[i].running = true;
-            int err = pthread_create(&thread[i], NULL, run_xdp, &ts[i]);
-            if (err) {
-                fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
-                exit(1);
-            }
-        }
-    } else {
-        for (int i = 0; i < glob.N; i++) {
-            ts[i].running = true;
-            int err = pthread_create(&thread[i], NULL, run, &ts[i]);
-            if (err) {
-                fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
-                exit(1);
-            }
+        int err = init_netmap();
+        if (err) exit(1);
+    }
+    pthread_t thread[threads];
+    void*(*runfun)(void*) = NULL;
+    if (xdp) runfun = run_xdp;
+    else if (netmap) runfun = run_netmap;
+    else runfun = run;
+
+    for (int i = 0; i < threads; i++) {
+        ts[i].running = true;
+        int err = pthread_create(&thread[i], NULL, runfun, &ts[i]);
+        if (err) {
+            fprintf(stderr, "pthread_create() failed for the %dth thread: %s\n", i + 1, strerror(err));
+            exit(1);
         }
     }
 
@@ -852,6 +909,8 @@ int main(int argc, char **argv) {
 
     now = time(0);
     printf("Stopped at %s", ctime(&now));
+
+    if (netmap) cleanup_netmap();
 
     addr_list_cleanup(&glob.locaddr);
     addr_list_cleanup(&glob.dstaddr);

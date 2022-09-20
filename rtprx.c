@@ -47,6 +47,7 @@ struct global_data {
     bool verbose;
     bool rxonly;
     struct str_list netdev;
+    int portstep;
 };
 struct global_data* globptr = NULL;
 
@@ -75,7 +76,7 @@ static void handle_udp_packet(struct ts_data* tsptr, const uint8_t* pkt) {
         time_t now = time(0);
         char nowstr[26];
         printf("Port %d expected seqnr %d but got %d at %s",
-            globptr->dstport0 + (int)(tsptr - tsptr0), tsptr->rtp_window.seqnr, seqnr, ctime_r(&now, nowstr));
+            globptr->dstport0 + (int)(tsptr - tsptr0) * globptr->portstep, tsptr->rtp_window.seqnr, seqnr, ctime_r(&now, nowstr));
         fflush(stdout);
     }
     rtp_window_push(&tsptr->rtp_window, seqnr);
@@ -112,7 +113,7 @@ static bool handle_eth_packet(const uint8_t* pkt, size_t len) {
     if (pkt > pktend) return false;
 
     uint16_t dstport = ntohs(udp->dest);
-    int tsindex = dstport - globptr->dstport0;
+    int tsindex = (dstport - globptr->dstport0) / globptr->portstep;
     if (tsindex < 0 || tsindex >= globptr->N) return false;
     struct ts_data* tsptr = &tsptr0[tsindex];
 
@@ -164,7 +165,7 @@ static int join_mcast(int fd, struct sockaddr_in* dstaddr, struct sockaddr_in* l
 static void *run(void *arg) {
     struct ts_data *tsptr = arg;
     int index = tsptr - tsptr0;
-    uint16_t dstport = globptr->dstport0 + index;
+    uint16_t dstport = globptr->dstport0 + index * globptr->portstep;
 
     char threadname[16];
     sprintf(threadname, "%s:%u", "rtprx", dstport);
@@ -323,7 +324,6 @@ static void* run_netmap(void* arg)
     }
 
     ns_t t = ns_now();
-    bool first = true;
 
     for (;!globptr->killed;) {
 
@@ -403,8 +403,6 @@ static void* run_netmap(void* arg)
             ns_totimeval(t - t1, &tv);
             select(0, NULL, NULL, NULL, &tv);
         }
-
-        first = false;
     }
 
 leave:
@@ -496,7 +494,7 @@ static void* run_xdp(void* arg)
     uint32_t mapkey = 0;
     struct global_params mapval = {
             .udp_lo  = globptr->dstport0,
-            .udp_hi = globptr->dstport0 + globptr->N - 1
+            .udp_hi = globptr->dstport0 + globptr->N * globptr->portstep - 1
     };
     err = bpf_map_update_elem(globalparamsfd, &mapkey, &mapval, 0);
     if (err)
@@ -524,7 +522,7 @@ static void* run_xdp(void* arg)
          .tx_size = 0,
          .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
          .xdp_flags = 0,
-         .bind_flags = 0
+         .bind_flags = XDP_ZEROCOPY
     };
 
     for (int queueid = 0; queueid < nrqueues; queueid++)
@@ -539,7 +537,8 @@ static void* run_xdp(void* arg)
             goto leave;
         }
 
-        err = xsk_socket__create(&xsk->xsk, dev, queueid, xsk->umem, &xsk->rxq, NULL, &xsk_config);
+        uint32_t queueidgaga = nrqueues + queueid;
+        err = xsk_socket__create(&xsk->xsk, dev, queueidgaga, xsk->umem, &xsk->rxq, NULL, &xsk_config);
         if (err)
         {
             fprintf(stderr, "xsk_socket__create() failed: %s\n", strerror(-err));
@@ -547,7 +546,7 @@ static void* run_xdp(void* arg)
         }
 
         int xskfd = xsk_socket__fd(xsk->xsk);
-        err = bpf_map_update_elem(xskmapfd, &queueid, &xskfd, 0);
+        err = bpf_map_update_elem(xskmapfd, &queueidgaga, &xskfd, 0);
         if (err)
         {
             fprintf(stderr, "bpf_map_update_elem(xsk_map, queue_id=%d, fd=%d) failed: %s\n", queueid, xskfd, strerror(-err));
@@ -672,7 +671,7 @@ static void report()
         uint32_t rate = (uint64_t)(valid - tsptr0[i].prev_valid) * 7 * 188 * 8 * 1000000 / elapsed;
         tsptr0[i].prev_valid = valid;
         printf("%10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %10" PRIu32 " | %6" PRIu32 ".%03" PRIu32 " | %10" PRIu32 "\n",
-                globptr->dstport0 + i,
+                globptr->dstport0 + i * globptr->portstep,
                 tsptr0[i].rtp_window.valid,
                 tsptr0[i].rtp_window.missing,
                 tsptr0[i].rtp_window.reordered,
@@ -703,7 +702,7 @@ static void report()
 }
 
 int main(int argc, char **argv) {
-    struct global_data glob = { .interval = 10000000ULL };
+    struct global_data glob = { .interval = 10000000ULL, .portstep = 1 };
     bool netmap = false, xdp = false;
     globptr = &glob;
 
@@ -714,6 +713,9 @@ int main(int argc, char **argv) {
             glob.verbose = true;
         } else if (!strcmp(argv[1], "-i")) {
             glob.interval = 1000ULL * atoi(argv[2]);
+            argv++; argc--;
+        } else if (!strcmp(argv[1], "-s")) {
+            glob.portstep = atoi(argv[2]);
             argv++; argc--;
         } else if (!strcmp(argv[1], "--netmap")) {
             str_list_parse(&glob.netdev, argv[2]);
