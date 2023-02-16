@@ -537,7 +537,16 @@ static void* run_xdp(void* arg)
             goto leave;
         }
 
-        uint32_t queueidgaga = nrqueues + queueid;
+        /* Stuff the receive path with buffers, we assume we have enough */
+        __u32 idx = 0;
+        xsk_ring_prod__reserve(&xsk->fillq, umem_config.fill_size, &idx);
+        for (__u32 i = 0; i < umem_config.fill_size; i++)
+        {
+            *xsk_ring_prod__fill_addr(&xsk->fillq, idx++) = umem_config.frame_size * i;
+        }
+        xsk_ring_prod__submit(&xsk->fillq, umem_config.fill_size);
+
+        uint32_t queueidgaga = 0/*nrqueues*/ + queueid;
         err = xsk_socket__create(&xsk->xsk, dev, queueidgaga, xsk->umem, &xsk->rxq, NULL, &xsk_config);
         if (err)
         {
@@ -552,15 +561,6 @@ static void* run_xdp(void* arg)
             fprintf(stderr, "bpf_map_update_elem(xsk_map, queue_id=%d, fd=%d) failed: %s\n", queueid, xskfd, strerror(-err));
             goto leave;
         }
-
-        /* Stuff the receive path with buffers, we assume we have enough */
-        __u32 idx = 0;
-        xsk_ring_prod__reserve(&xsk->fillq, umem_config.fill_size, &idx);
-        for (__u32 i = 0; i < umem_config.fill_size; i++)
-        {
-            *xsk_ring_prod__fill_addr(&xsk->fillq, idx++) = umem_config.frame_size * i;
-        }
-        xsk_ring_prod__submit(&xsk->fillq, umem_config.fill_size);
     }
 
     igmpfd = socket(AF_INET, SOCK_DGRAM, 0);

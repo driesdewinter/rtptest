@@ -99,13 +99,18 @@ static inline int get_nrqueues(const char* dev)
         if (err)
             fprintf(stderr, "ioctl(SIOCETHTOOL, {dev=%s cmd=ETHTOOL_GCHANNELS}) failed: %m\n", dev);
 
-        if (err || channels.combined_count == 0)
+
+        if (err)
                 /* If the device says it has no channels, then all traffic
                  * is sent to a single stream, so max queues = 1.
                  */
                 ret = 1;
-        else
+        else if (channels.combined_count)
                 ret = channels.combined_count;
+        else if (channels.rx_count)
+                ret = channels.rx_count;
+        else
+                ret = 1;
 
         close(fd);
         return ret;
