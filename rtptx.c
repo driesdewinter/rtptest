@@ -548,16 +548,16 @@ static void* run_xdp(void* arg)
 
     struct xsk_umem_config umem_config = {
          .fill_size = 8192,
-         .comp_size = 8192,
+         .comp_size = 4096,
          .frame_size = 2048,
          .frame_headroom = 0,
          .flags = 0
     };
     struct xsk_socket_config xsk_config = {
-         .rx_size = 0,
-         .tx_size = 8192,
+         .rx_size = 4096,
+         .tx_size = 4096,
          .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-         .xdp_flags = XDP_ZEROCOPY,
+         .xdp_flags = 0,
          .bind_flags = 0
     };
 
@@ -577,6 +577,16 @@ static void* run_xdp(void* arg)
         fprintf(stderr, "xsk_umem__create() failed: %s\n", strerror(-err));
         goto leave;
     }
+
+    /* Stuff the fill queue, otherwise ice drivers complains.
+     * With invalid pointers though we won't use them anyway. */
+    __u32 idx = 0;
+    xsk_ring_prod__reserve(&xsk->fillq, umem_config.fill_size, &idx);
+    for (__u32 i = 0; i < umem_config.fill_size; i++)
+    {
+        *xsk_ring_prod__fill_addr(&xsk->fillq, idx++) = umem_config.frame_size * i;
+    }
+    xsk_ring_prod__submit(&xsk->fillq, umem_config.fill_size);
 
     err = xsk_socket__create(&xsk->xsk, dev, index, xsk->umem, NULL, &xsk->txq, &xsk_config);
     if (err)
@@ -651,7 +661,6 @@ static void* run_xdp(void* arg)
         err = EAGAIN;
         while (err == EAGAIN)
             err = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-
         { // collect frame pointers of completed transmissions
             __u32 compidx = 0;
             size_t n = xsk_ring_cons__peek(&xsk->compq, umem_config.comp_size, &compidx);
