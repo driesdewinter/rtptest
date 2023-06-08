@@ -669,8 +669,6 @@ static void* run_xdp(void* arg)
                 frame_stack[frame_stack_ptr++] = *xsk_ring_cons__comp_addr(&xsk->compq, compidx++);
             }
             if (n) xsk_ring_cons__release(&xsk->compq, n);
-            if (globptr->verbose) printf("Completed %zu\n", n);
-
         }
 
 
