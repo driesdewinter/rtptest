@@ -12,7 +12,7 @@ CFLAGS-y=$(CFLAGS)
 CFLAGS-$(XDP) += -DXDP
 CFLAGS-$(NETMAP) += -DNETMAP
 LDFLAGS-y=$(LDFLAGS) -lrt
-LDFLAGS-$(XDP) += -lbpf -lelf
+LDFLAGS-$(XDP) += -lxdp -lbpf -lelf
 
 # CFLAGS-$(XDP) += -DXDP -I$(XDP_TOOLS_PATH)/lib/libbpf/src/root/usr/include
 # LDFLAGS-$(XDP) +=  -L$(XDP_TOOLS_PATH)/lib/libbpf/src -L$(XDP_TOOLS_PATH)/lib/libxdp/ -lxdp -lbpf
@@ -30,7 +30,7 @@ rtp_window_test: rtp_window_test.c $(HDRS)
 ifeq ($(XDP), y)
 
 bpfprog.o: bpfprog.c $(HDRS)
-	$(BPFC) -O2 -Wall -Wextra -c $(CFLAGS-y) bpfprog.c -o bpfprog.o
+	$(BPFC) -Wall -Wextra -O2 -I. -g $(CFLAGS-y) -c bpfprog.c -o bpfprog.o
 
 default: bpfprog.o
 

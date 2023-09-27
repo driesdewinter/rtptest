@@ -11,23 +11,19 @@
 
 #include "bpfprog.h"
 
-/* Lesson#1: See how a map is defined.
- * - Here an array with XDP_ACTION_MAX (max_)entries are created.
- * - The idea is to keep stats per (enum) xdp_action
- */
-struct bpf_map_def SEC("maps") global_params_map = {
-    .type        = BPF_MAP_TYPE_ARRAY,
-    .key_size    = sizeof(__u32),
-    .value_size  = sizeof(struct global_params),
-    .max_entries = 1,
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, struct global_params);
+    __uint(max_entries, 1);
+} global_params_map SEC(".maps");
 
-struct bpf_map_def SEC("maps") xsk_map = {
-    .type        = BPF_MAP_TYPE_XSKMAP,
-    .key_size    = sizeof(__u32),
-    .value_size  = sizeof(int),
-    .max_entries = 1024,  // at least the maximum number of rx queues
-};
+struct {
+  __uint(type, BPF_MAP_TYPE_XSKMAP);
+  __type(key, __u32);
+  __type(value, int);
+  __uint(max_entries, 1024);  // at least the maximum number of rx queues
+} xsk_map SEC(".maps");
 
 
 struct vlanhdr {

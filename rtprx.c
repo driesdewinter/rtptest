@@ -432,7 +432,7 @@ static void* run_netmap(void* arg)
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
-#include <bpf/xsk.h>
+#include <xdp/xsk.h>
 #include "bpfprog.h"
 
 static void* run_xdp(void* arg)
@@ -440,11 +440,10 @@ static void* run_xdp(void* arg)
     struct ts_data *threadptr = arg;
     const char* dev = str_list_get(&globptr->netdev, 0);
     int igmpfd = - 1;
-    int progfd = -1;
+    struct bpf_object* object = NULL;
     int globalparamsfd = -1;
     int xskmapfd = -1;
     int nrqueues = get_nrqueues(dev);
-    struct bpf_object *obj = NULL;
     int err = 0;
 
     char threadname[16];
@@ -470,21 +469,29 @@ static void* run_xdp(void* arg)
         goto leave;
     }
 
-    /* Use libbpf for extracting BPF byte-code from BPF-ELF object, and
-     * loading this into the kernel via bpf-syscall */
-    err = bpf_prog_load("bpfprog.o", BPF_PROG_TYPE_XDP, &obj, &progfd);
-    if (err) {
-        fprintf(stderr, "bpf_prog_load(\"bpfprog.o\", BPF_PROG_TYPE_XDP) failed: %s\n", strerror(-err));
-        goto leave;
+    object = bpf_object__open("bpfprog.o");
+    if (!object) {
+      fprintf(stderr, "bpf_object__open(\"bpfprog.o\") failed: %s\n", strerror(errno));
+      goto leave;
     }
 
-    struct bpf_map *map = bpf_object__find_map_by_name(obj, "global_params_map");
+    struct bpf_program *program = bpf_object__next_program(object, NULL);
+    bpf_program__set_type(program, BPF_PROG_TYPE_XDP);
+
+    err = bpf_object__load(object);
+    if (err) {
+      fprintf(stderr, "bpf_object__load(\"bpfprog.o\") failed: %s\n", strerror(errno));
+      goto leave;
+    }
+    int progfd = bpf_program__fd(program);
+
+    struct bpf_map *map = bpf_object__find_map_by_name(object, "global_params_map");
     if (!map) {
         fprintf(stderr, "bpf_object__find_map_by_name(global_params_map) failed: %m\n");
         goto leave;
     }
     globalparamsfd = bpf_map__fd(map);
-    map = bpf_object__find_map_by_name(obj, "xsk_map");
+    map = bpf_object__find_map_by_name(object, "xsk_map");
     if (!map) {
         fprintf(stderr, "bpf_object__find_map_by_name(xsk_map) failed: %m\n");
         goto leave;
@@ -503,7 +510,7 @@ static void* run_xdp(void* arg)
         goto leave;
     }
 
-    err = bpf_set_link_xdp_fd(ifindex, progfd, 0);
+    err = bpf_xdp_attach(ifindex, progfd, 0, NULL);
     if (err)
     {
         fprintf(stderr, "bpf_set_link_xdp_fd(%s) failed: %s\n", dev, strerror(-err));
@@ -626,8 +633,8 @@ leave:
       xsk_umem__delete(xsk->umem);
       free(xsk->mem);
     }
-    if (ifindex) bpf_set_link_xdp_fd(ifindex, -1, 0); // detach XDP program from network device.
-    bpf_object__close(obj);
+    if (ifindex) bpf_xdp_detach(ifindex, 0, NULL); // detach XDP program from network device.
+    bpf_object__close(object);
     threadptr->running = false;
     return NULL;
 }

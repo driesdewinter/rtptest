@@ -519,7 +519,7 @@ static void cleanup_netmap() {}
 
 #ifdef XDP
 
-#include <bpf/xsk.h>
+#include <xdp/xsk.h>
 #include "bpfprog.h"
 
 static void* run_xdp(void* arg)
