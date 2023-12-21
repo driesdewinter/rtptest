@@ -270,7 +270,7 @@ static void* run_netmap(void* arg)
     const char* dev = str_list_get(&globptr->netdev, index);
 
     char threadname[16];
-    sprintf(threadname, "%s:%s", "rtprx", dev);
+    snprintf(threadname, 16, "%s:%s", "rtprx", dev);
     prctl(PR_SET_NAME, threadname, 0, 0, 0);
 
     struct nmreq_register reg = {
@@ -447,7 +447,7 @@ static void* run_xdp(void* arg)
     int err = 0;
 
     char threadname[16];
-    sprintf(threadname, "%s:%s", "rtprx", dev);
+    snprintf(threadname, 16, "%s:%s", "rtprx", dev);
     prctl(PR_SET_NAME, threadname, 0, 0, 0);
 
     struct xsk_info

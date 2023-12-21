@@ -346,7 +346,7 @@ static void* run_netmap(void* arg)
     const char* dev = str_list_get(&globptr->netdev, 0);
 
     char threadname[16];
-    sprintf(threadname, "%s:%s:%u", "rtptx", dev, index);
+    snprintf(threadname, 16, "%s:%s:%u", "rtptx", dev, index);
     prctl(PR_SET_NAME, threadname, 0, 0, 0);
     ns_t t = ns_now();
 
@@ -531,7 +531,7 @@ static void* run_xdp(void* arg)
     int err = 0;
 
     char threadname[16];
-    sprintf(threadname, "%s:%s:%d", "rtptx", dev, index);
+    snprintf(threadname, 16, "%s:%s:%d", "rtptx", dev, index);
     prctl(PR_SET_NAME, threadname, 0, 0, 0);
 
     struct xsk_info
