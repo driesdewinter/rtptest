@@ -561,15 +561,15 @@ static void* run_xdp(void* arg)
          .bind_flags = 0
     };
 
-    __u64 frame_stack[umem_config.comp_size];
+    __u64 frame_stack[umem_config.comp_size + umem_config.fill_size];
     __u32 frame_stack_ptr = 0;
-    while (frame_stack_ptr < umem_config.comp_size)
+    while (frame_stack_ptr < umem_config.comp_size + umem_config.fill_size)
     {
         frame_stack[frame_stack_ptr] = frame_stack_ptr * umem_config.frame_size;
         frame_stack_ptr++;
     }
 
-    size_t umem_size = umem_config.comp_size * umem_config.frame_size;
+    size_t umem_size = (umem_config.comp_size + umem_config.fill_size) * umem_config.frame_size;
     posix_memalign(&xsk->mem, getpagesize(), umem_size);
     err = xsk_umem__create(&xsk->umem, xsk->mem, umem_size, &xsk->fillq, &xsk->compq, &umem_config);
     if (err)
@@ -578,13 +578,12 @@ static void* run_xdp(void* arg)
         goto leave;
     }
 
-    /* Stuff the fill queue, otherwise ice drivers complains.
-     * With invalid pointers though we won't use them anyway. */
+    /* Stuff the fill queue, otherwise ice drivers complains. */
     __u32 idx = 0;
     xsk_ring_prod__reserve(&xsk->fillq, umem_config.fill_size, &idx);
     for (__u32 i = 0; i < umem_config.fill_size; i++)
     {
-        *xsk_ring_prod__fill_addr(&xsk->fillq, idx++) = umem_config.frame_size * i;
+        *xsk_ring_prod__fill_addr(&xsk->fillq, idx++) = frame_stack[--frame_stack_ptr];
     }
     xsk_ring_prod__submit(&xsk->fillq, umem_config.fill_size);
 
