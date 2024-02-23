@@ -29,10 +29,13 @@ rtp_window_test: rtp_window_test.c $(HDRS)
 
 ifeq ($(XDP), y)
 
-bpfprog.o: bpfprog.c $(HDRS)
-	$(BPFC) -Wall -Wextra -O2 -I. -g $(CFLAGS-y) -c bpfprog.c -o bpfprog.o
+bpftx.o: bpftx.c $(HDRS)
+	$(BPFC) -Wall -Wextra -O2 -I. -g $(CFLAGS-y) -c bpftx.c -o bpftx.o
 
-default: bpfprog.o
+bpfrx.o: bpfrx.c $(HDRS)
+	$(BPFC) -Wall -Wextra -O2 -I. -g $(CFLAGS-y) -c bpfrx.c -o bpfrx.o
+
+default: bpftx.o bpfrx.o
 
 endif
 

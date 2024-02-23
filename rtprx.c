@@ -433,7 +433,7 @@ static void* run_netmap(void* arg)
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <xdp/xsk.h>
-#include "bpfprog.h"
+#include "bpfrx.h"
 
 static void* run_xdp(void* arg)
 {
@@ -469,9 +469,9 @@ static void* run_xdp(void* arg)
         goto leave;
     }
 
-    object = bpf_object__open("bpfprog.o");
+    object = bpf_object__open("bpfrx.o");
     if (!object) {
-      fprintf(stderr, "bpf_object__open(\"bpfprog.o\") failed: %s\n", strerror(errno));
+      fprintf(stderr, "bpf_object__open(\"bpfrx.o\") failed: %s\n", strerror(errno));
       goto leave;
     }
 
@@ -480,7 +480,7 @@ static void* run_xdp(void* arg)
 
     err = bpf_object__load(object);
     if (err) {
-      fprintf(stderr, "bpf_object__load(\"bpfprog.o\") failed: %s\n", strerror(errno));
+      fprintf(stderr, "bpf_object__load(\"bpfrx.o\") failed: %s\n", strerror(errno));
       goto leave;
     }
     int progfd = bpf_program__fd(program);

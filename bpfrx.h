@@ -1,5 +1,5 @@
-#ifndef BPFPROG_H_
-#define BPFPROG_H_
+#ifndef BPFRX_H_
+#define BPFRX_H_
 
 struct global_params
 {
@@ -7,4 +7,4 @@ struct global_params
     __u16 udp_hi;
 };
 
-#endif /* BPFPROG_H_ */
+#endif /* BPFRX_H_ */

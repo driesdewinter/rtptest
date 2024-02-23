@@ -9,7 +9,7 @@
 #include <linux/in.h>
 #include <asm/byteorder.h>
 
-#include "bpfprog.h"
+#include "bpfrx.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);

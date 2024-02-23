@@ -1,3 +1,4 @@
+
 #define __STDC_FORMAT_MACROS
 #define _GNU_SOURCE
 #include <inttypes.h>
@@ -520,7 +521,6 @@ static void cleanup_netmap() {}
 #ifdef XDP
 
 #include <xdp/xsk.h>
-#include "bpfprog.h"
 
 static void* run_xdp(void* arg)
 {
@@ -529,10 +529,7 @@ static void* run_xdp(void* arg)
     int step = globptr->nrqueues;
     const char* dev = str_list_get(&globptr->netdev, 0);
     int err = 0;
-
-    char threadname[16];
-    snprintf(threadname, 16, "%s:%s:%d", "rtptx", dev, index);
-    prctl(PR_SET_NAME, threadname, 0, 0, 0);
+    struct bpf_object* object = NULL;
 
     struct xsk_info
     {
@@ -563,6 +560,41 @@ static void* run_xdp(void* arg)
 
     __u64 frame_stack[umem_config.comp_size + umem_config.fill_size];
     __u32 frame_stack_ptr = 0;
+
+    char threadname[16];
+    snprintf(threadname, 16, "%s:%s:%d", "rtptx", dev, index);
+    prctl(PR_SET_NAME, threadname, 0, 0, 0);
+
+    int ifindex = if_nametoindex(dev);
+    if (!ifindex)
+    {
+        fprintf(stderr, "if_nametoindex(%s) failed: %m\n", dev);
+        goto leave;
+    }
+
+    object = bpf_object__open("bpftx.o");
+    if (!object) {
+      fprintf(stderr, "bpf_object__open(\"bpftx.o\") failed: %s\n", strerror(errno));
+      goto leave;
+    }
+
+    struct bpf_program *program = bpf_object__next_program(object, NULL);
+    bpf_program__set_type(program, BPF_PROG_TYPE_XDP);
+
+    err = bpf_object__load(object);
+    if (err) {
+      fprintf(stderr, "bpf_object__load(\"bpftx.o\") failed: %s\n", strerror(errno));
+      goto leave;
+    }
+    int progfd = bpf_program__fd(program);
+
+    err = bpf_xdp_attach(ifindex, progfd, 0, NULL);
+    if (err)
+    {
+        fprintf(stderr, "bpf_set_link_xdp_fd(%s) failed: %s\n", dev, strerror(-err));
+        goto leave;
+    }
+
     while (frame_stack_ptr < umem_config.comp_size + umem_config.fill_size)
     {
         frame_stack[frame_stack_ptr] = frame_stack_ptr * umem_config.frame_size;
@@ -586,6 +618,7 @@ static void* run_xdp(void* arg)
         *xsk_ring_prod__fill_addr(&xsk->fillq, idx++) = frame_stack[--frame_stack_ptr];
     }
     xsk_ring_prod__submit(&xsk->fillq, umem_config.fill_size);
+    __u64 rxtxboundary = frame_stack[frame_stack_ptr];
 
     err = xsk_socket__create(&xsk->xsk, dev, index, xsk->umem, NULL, &xsk->txq, &xsk_config);
     if (err)
@@ -593,8 +626,6 @@ static void* run_xdp(void* arg)
         fprintf(stderr, "xsk_socket__create() failed: %s\n", strerror(-err));
         goto leave;
     }
-
-
 
     for (int tsindex = index; tsindex < globptr->N; tsindex += step)
     {
@@ -665,7 +696,14 @@ static void* run_xdp(void* arg)
             size_t n = xsk_ring_cons__peek(&xsk->compq, umem_config.comp_size, &compidx);
             for (__u32 i = 0; i < n; i++)
             {
-                frame_stack[frame_stack_ptr++] = *xsk_ring_cons__comp_addr(&xsk->compq, compidx++);
+                __u64 frame = *xsk_ring_cons__comp_addr(&xsk->compq, compidx++);
+                if (frame < rxtxboundary) {
+                    frame_stack[frame_stack_ptr++] = frame;
+                } else {
+                    xsk_ring_prod__reserve(&xsk->fillq, 1, &idx);
+                    *xsk_ring_prod__fill_addr(&xsk->fillq, idx++) = frame;
+                    xsk_ring_prod__submit(&xsk->fillq, 1);
+                }
             }
             if (n) xsk_ring_cons__release(&xsk->compq, n);
         }
@@ -690,6 +728,9 @@ static void* run_xdp(void* arg)
     }
 
 leave:
+    if (ifindex) bpf_xdp_detach(ifindex, 0, NULL); // detach XDP program from network device.
+    bpf_object__close(object);
+
     xsk_socket__delete(xsk->xsk);
     xsk_umem__delete(xsk->umem);
     free(xsk->mem);
